@@ -117,6 +117,11 @@ impl Env {
         }
     }
 
+    /// Return names of all bindings in the current scope (not parents).
+    pub fn binding_names(&self) -> Vec<String> {
+        self.bindings.keys().cloned().collect()
+    }
+
     pub fn update(&mut self, name: &str, value: Value) -> bool {
         if self.bindings.contains_key(name) {
             self.bindings.insert(name.to_string(), value);
@@ -136,7 +141,7 @@ enum Signal {
 }
 
 pub struct Interpreter {
-    env: Env,
+    pub(crate) env: Env,
 }
 
 impl Interpreter {
@@ -149,7 +154,8 @@ impl Interpreter {
             "map", "filter", "fold", "range", "split", "join", "trim",
             "contains", "sort", "sort_by", "rev", "enumerate", "zip",
             "flat_map", "any", "all", "find", "unique", "chunk", "take",
-            "skip", "min", "max", "abs", "dbg", "assert", "type_of",
+            "skip", "min", "max", "abs", "dbg", "assert", "assert_eq",
+            "assert_ne", "assert_true", "assert_false", "type_of",
             "read_file", "write_file", "read_line", "parse_json",
             "group_by", "flatten", "reduce", "replace", "starts_with",
             "ends_with", "to_upper", "to_lower",
@@ -161,8 +167,9 @@ impl Interpreter {
         Interpreter { env }
     }
 
-    pub fn run(&mut self, program: &Program) -> Result<(), String> {
-        // First pass: collect all function declarations
+    /// Load all function declarations from a program into the environment
+    /// without executing main() or top-level expressions.
+    pub fn load_declarations(&mut self, program: &Program) {
         for item in &program.items {
             if let Item::FnDecl(f) = item {
                 let val = Value::Fn {
@@ -174,6 +181,11 @@ impl Interpreter {
                 self.env.set(f.name.clone(), val);
             }
         }
+    }
+
+    pub fn run(&mut self, program: &Program) -> Result<(), String> {
+        // First pass: collect all function declarations
+        self.load_declarations(program);
 
         // Look for main() and call it
         if let Some(main_fn) = self.env.get("main") {
@@ -605,7 +617,7 @@ impl Interpreter {
         }
     }
 
-    fn call_function(&mut self, func: &Value, args: &[Value]) -> Result<Value, String> {
+    pub(crate) fn call_function(&mut self, func: &Value, args: &[Value]) -> Result<Value, String> {
         match func {
             Value::BuiltinFn(name) => self.call_builtin(name, args),
             Value::Fn {
@@ -1067,6 +1079,59 @@ impl Interpreter {
                     Err("Assertion failed".to_string())
                 }
             }
+            "assert_eq" => {
+                if args.len() != 2 {
+                    return Err("assert_eq requires 2 arguments".to_string());
+                }
+                let actual = &args[0];
+                let expected = &args[1];
+                if self.values_equal(actual, expected) {
+                    Ok(Value::Unit)
+                } else {
+                    Err(format!(
+                        "[assert] expected: {}, got: {}",
+                        self.value_to_display(expected),
+                        self.value_to_display(actual)
+                    ))
+                }
+            }
+            "assert_ne" => {
+                if args.len() != 2 {
+                    return Err("assert_ne requires 2 arguments".to_string());
+                }
+                let actual = &args[0];
+                let expected = &args[1];
+                if !self.values_equal(actual, expected) {
+                    Ok(Value::Unit)
+                } else {
+                    Err(format!(
+                        "[assert] expected values to differ, both are: {}",
+                        self.value_to_display(actual)
+                    ))
+                }
+            }
+            "assert_true" => {
+                let val = args.first().ok_or("assert_true requires 1 argument")?;
+                if val.is_truthy() {
+                    Ok(Value::Unit)
+                } else {
+                    Err(format!(
+                        "[assert] expected truthy value, got: {}",
+                        self.value_to_display(val)
+                    ))
+                }
+            }
+            "assert_false" => {
+                let val = args.first().ok_or("assert_false requires 1 argument")?;
+                if !val.is_truthy() {
+                    Ok(Value::Unit)
+                } else {
+                    Err(format!(
+                        "[assert] expected falsy value, got: {}",
+                        self.value_to_display(val)
+                    ))
+                }
+            }
             "type_of" => {
                 let val = args.first().ok_or("type_of requires 1 argument")?;
                 let type_name = match val {
@@ -1357,5 +1422,15 @@ impl Interpreter {
 
     fn value_to_debug(&self, value: &Value) -> String {
         format!("{:?}", value)
+    }
+
+    /// Format a value for user-facing display in assertion messages.
+    /// Uses the Display impl (e.g., `1`, `"hello"`, `[1, 2]`) with
+    /// strings wrapped in quotes to distinguish them from other types.
+    fn value_to_display(&self, value: &Value) -> String {
+        match value {
+            Value::Str(s) => format!("\"{}\"", s),
+            other => format!("{}", other),
+        }
     }
 }
