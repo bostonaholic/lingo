@@ -5,46 +5,48 @@ use std::process;
 use lingo::interpreter;
 use lingo::lexer;
 use lingo::parser;
+use lingo::repl;
 use lingo::test_runner;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    if args.len() < 2 {
-        eprintln!("Usage: lingo [--test] <file.ln>");
-        process::exit(1);
-    }
-
     let test_mode = args.iter().any(|a| a == "--test");
-    let filename = args
-        .iter()
-        .skip(1)
-        .find(|a| *a != "--test");
+    let filename = args.iter().skip(1).find(|a| *a != "--test");
 
-    let filename = match filename {
-        Some(f) => f,
-        None => {
-            eprintln!("Usage: lingo [--test] <file.ln>");
+    match (test_mode, filename) {
+        (true, None) => {
+            eprintln!("Usage: lingo --test <file.ln>");
             process::exit(1);
         }
-    };
+        (false, None) => {
+            if let Err(e) = repl::start() {
+                eprintln!("Error: {}", e);
+                process::exit(1);
+            }
+        }
+        (true, Some(filename)) => {
+            let source = read_file(filename);
+            if let Err(e) = run_tests(&source) {
+                eprintln!("Error: {}", e);
+                process::exit(1);
+            }
+        }
+        (false, Some(filename)) => {
+            let source = read_file(filename);
+            if let Err(e) = run(&source) {
+                eprintln!("Error: {}", e);
+                process::exit(1);
+            }
+        }
+    }
+}
 
-    let source = match fs::read_to_string(filename) {
+fn read_file(filename: &str) -> String {
+    match fs::read_to_string(filename) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Error reading file '{}': {}", filename, e);
-            process::exit(1);
-        }
-    };
-
-    if test_mode {
-        if let Err(e) = run_tests(&source) {
-            eprintln!("Error: {}", e);
-            process::exit(1);
-        }
-    } else {
-        if let Err(e) = run(&source) {
-            eprintln!("Error: {}", e);
             process::exit(1);
         }
     }

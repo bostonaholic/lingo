@@ -15,6 +15,7 @@ pub struct Program {
 pub enum Item {
     FnDecl(FnDecl),
     ExprStmt(Expr),
+    Stmt(Stmt),
 }
 
 #[derive(Debug, Clone)]

@@ -27,6 +27,10 @@ impl Parser {
     fn parse_item(&mut self) -> Result<Item, String> {
         if self.check(&TokenKind::Fn) {
             Ok(Item::FnDecl(self.parse_fn_decl()?))
+        } else if self.check(&TokenKind::Let) {
+            let stmt = self.parse_let_stmt()?;
+            self.expect_terminator()?;
+            Ok(Item::Stmt(stmt))
         } else {
             let expr = self.parse_expr()?;
             self.expect_terminator()?;

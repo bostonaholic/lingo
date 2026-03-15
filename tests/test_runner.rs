@@ -379,6 +379,248 @@ fn cli_test_flag_without_filename_errors() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// eval_item tests
+// ---------------------------------------------------------------------------
+
+/// Helper: parse source into a Program.
+fn parse_program(source: &str) -> lingo::ast::Program {
+    let mut lexer = Lexer::new(source);
+    let tokens = lexer.tokenize().unwrap();
+    let mut parser = Parser::new(tokens);
+    parser.parse_program().unwrap()
+}
+
+#[test]
+fn eval_item_expression_returns_value() {
+    let program = parse_program("1 + 2");
+    let mut interp = Interpreter::new();
+    let result = interp.eval_item(&program.items[0]);
+    assert!(result.is_ok());
+    assert_eq!(format!("{}", result.unwrap()), "3");
+}
+
+#[test]
+fn eval_item_string_returns_value() {
+    let program = parse_program(r#""hello""#);
+    let mut interp = Interpreter::new();
+    let result = interp.eval_item(&program.items[0]);
+    assert!(result.is_ok());
+    assert_eq!(format!("{}", result.unwrap()), "hello");
+}
+
+#[test]
+fn eval_item_let_returns_unit() {
+    let program = parse_program("let x = 5");
+    let mut interp = Interpreter::new();
+    let result = interp.eval_item(&program.items[0]);
+    assert!(result.is_ok());
+    assert_eq!(format!("{}", result.unwrap()), "()");
+}
+
+#[test]
+fn eval_item_fn_decl_returns_unit() {
+    let program = parse_program("fn foo() { 42 }");
+    let mut interp = Interpreter::new();
+    let result = interp.eval_item(&program.items[0]);
+    assert!(result.is_ok());
+    assert_eq!(format!("{}", result.unwrap()), "()");
+}
+
+#[test]
+fn eval_item_fn_decl_then_call() {
+    let decl = parse_program("fn foo() { 42 }");
+    let call = parse_program("foo()");
+    let mut interp = Interpreter::new();
+    interp.eval_item(&decl.items[0]).unwrap();
+    let result = interp.eval_item(&call.items[0]);
+    assert!(result.is_ok());
+    assert_eq!(format!("{}", result.unwrap()), "42");
+}
+
+#[test]
+fn eval_item_let_then_use() {
+    let let_stmt = parse_program("let x = 10");
+    let use_var = parse_program("x");
+    let mut interp = Interpreter::new();
+    interp.eval_item(&let_stmt.items[0]).unwrap();
+    let result = interp.eval_item(&use_var.items[0]);
+    assert!(result.is_ok());
+    assert_eq!(format!("{}", result.unwrap()), "10");
+}
+
+#[test]
+fn eval_item_undefined_variable_returns_err() {
+    let program = parse_program("undefined_var");
+    let mut interp = Interpreter::new();
+    let result = interp.eval_item(&program.items[0]);
+    assert!(result.is_err());
+}
+
+// ---------------------------------------------------------------------------
+// REPL integration tests
+// ---------------------------------------------------------------------------
+
+use std::process::Stdio;
+
+#[test]
+fn repl_expression_prints_result() {
+    let mut child = Command::new(cargo_bin())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start REPL");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"1 + 2\n")
+        .unwrap();
+
+    let output = child.wait_with_output().expect("failed to wait");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("3"), "stdout should contain 3: {}", stdout);
+}
+
+#[test]
+fn repl_state_persists_across_inputs() {
+    let mut child = Command::new(cargo_bin())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start REPL");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"let x = 5\nx\n")
+        .unwrap();
+
+    let output = child.wait_with_output().expect("failed to wait");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("5"), "stdout should contain 5: {}", stdout);
+}
+
+#[test]
+fn repl_fn_declarations_persist() {
+    let mut child = Command::new(cargo_bin())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start REPL");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"fn add(a, b) { a + b }\nadd(1, 2)\n")
+        .unwrap();
+
+    let output = child.wait_with_output().expect("failed to wait");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("3"), "stdout should contain 3: {}", stdout);
+}
+
+#[test]
+fn repl_eof_exits_cleanly() {
+    let mut child = Command::new(cargo_bin())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start REPL");
+
+    // Close stdin immediately (EOF)
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("failed to wait");
+    assert!(
+        output.status.success(),
+        "REPL should exit 0 on EOF, got: {:?}",
+        output.status
+    );
+}
+
+#[test]
+fn repl_error_recovery() {
+    let mut child = Command::new(cargo_bin())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start REPL");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"undefined_var\n")
+        .unwrap();
+
+    let output = child.wait_with_output().expect("failed to wait");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.is_empty(),
+        "stderr should contain an error message"
+    );
+}
+
+#[test]
+fn repl_continues_after_error() {
+    let mut child = Command::new(cargo_bin())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start REPL");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"1 + 2\nundefined_var\n3 + 4\n")
+        .unwrap();
+
+    let output = child.wait_with_output().expect("failed to wait");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("3"), "stdout should contain 3: {}", stdout);
+    assert!(stdout.contains("7"), "stdout should contain 7: {}", stdout);
+}
+
+#[test]
+fn repl_empty_line_no_error() {
+    let mut child = Command::new(cargo_bin())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start REPL");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"\n")
+        .unwrap();
+
+    let output = child.wait_with_output().expect("failed to wait");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.is_empty(),
+        "stderr should be empty for blank line: {}",
+        stderr
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CLI tests
+// ---------------------------------------------------------------------------
+
 #[test]
 fn cli_normal_mode_unchanged() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");

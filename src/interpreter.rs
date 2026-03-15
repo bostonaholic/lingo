@@ -191,15 +191,40 @@ impl Interpreter {
         if let Some(main_fn) = self.env.get("main") {
             self.call_function(&main_fn, &[])?;
         } else {
-            // Execute top-level expressions
+            // Execute top-level expressions and statements
             for item in &program.items {
-                if let Item::ExprStmt(expr) = item {
-                    self.eval_expr(expr)?;
+                match item {
+                    Item::ExprStmt(expr) => {
+                        self.eval_expr(expr)?;
+                    }
+                    Item::Stmt(stmt) => {
+                        self.eval_stmt(stmt)?;
+                    }
+                    Item::FnDecl(_) => {}
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// Evaluate a single top-level item and return the resulting value.
+    /// Used by the REPL to evaluate each parsed item independently.
+    pub fn eval_item(&mut self, item: &Item) -> Result<Value, String> {
+        match item {
+            Item::FnDecl(f) => {
+                let val = Value::Fn {
+                    name: f.name.clone(),
+                    params: f.params.clone(),
+                    body: f.body.clone(),
+                    closure: self.env.clone(),
+                };
+                self.env.set(f.name.clone(), val);
+                Ok(Value::Unit)
+            }
+            Item::ExprStmt(expr) => self.eval_expr(expr),
+            Item::Stmt(stmt) => self.eval_stmt(stmt),
+        }
     }
 
     fn eval_block(&mut self, block: &Block) -> Result<Value, String> {
