@@ -1,0 +1,43 @@
+fn double(x: Int) -> Int {
+  x * 2
+}
+
+fn main() {
+  # Arithmetic
+  let x = 10
+  let y = 3
+  println("x + y = {x + y}")
+  println("x % y = {x % y}")
+
+  # If/else as expression
+  let status = if x > 5 { "big" } else { "small" }
+  println("x is {status}")
+
+  # Lists and pipeline
+  let nums = [1, 2, 3, 4, 5]
+  let doubled = nums |> map(n => n * 2)
+  println("doubled: {doubled}")
+
+  let evens = nums |> filter(n => n % 2 == 0)
+  println("evens: {evens}")
+
+  let total = nums |> fold(0, (acc, n) => acc + n)
+  println("total: {total}")
+
+  # Function calls
+  println("double(21) = {double(21)}")
+
+  # String operations
+  let greeting = "Hello, World!"
+  println("length: {len(greeting)}")
+  println("upper: {to_upper(greeting)}")
+
+  # Pattern matching
+  let items = [1, 2, 3]
+  let desc = match len(items) {
+    0 => "empty"
+    1 => "singleton"
+    _ => "multiple"
+  }
+  println("items: {desc}")
+}

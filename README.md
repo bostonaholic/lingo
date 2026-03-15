@@ -47,6 +47,48 @@ fn main() {
 }
 ```
 
+## Getting Started
+
+### Prerequisites
+
+- [Rust](https://www.rust-lang.org/tools/install) (1.70+)
+
+### Build
+
+```bash
+cargo build
+```
+
+### Run a Lingo program
+
+```bash
+cargo run -- examples/fizzbuzz.ln
+cargo run -- examples/hello.ln
+cargo run -- examples/basics.ln
+```
+
+### Install globally
+
+```bash
+cargo install --path .
+lingo examples/fizzbuzz.ln
+```
+
+### Write your own
+
+Create a `.ln` file with a `main` function:
+
+```lingo
+fn main() {
+  let name = "World"
+  println("Hello, {name}!")
+}
+```
+
+```bash
+cargo run -- my_program.ln
+```
+
 ## Documentation
 
 - [Language Specification](SPECIFICATION.md) -- complete language design covering syntax,
@@ -65,8 +107,20 @@ quality. Supporting documents are in the `docs/plans/` directory:
 
 ## Status
 
-Lingo is in the **language design** phase. The specification is complete; implementation has not
-yet begun.
+Lingo has a working **tree-walking interpreter** that supports:
+
+- Functions with implicit returns
+- `for`/`in` with ranges (`1..=100`, `1..10`)
+- `let` bindings
+- `match` with tuple, literal, wildcard, and identifier patterns
+- `if`/`else` as expressions
+- String interpolation (`"hello {name}"`)
+- Pipeline operator (`nums |> map(n => n * 2)`)
+- Lambda expressions (`n => n * 2`, `(a, b) => a + b`)
+- Lists and tuples
+- 40+ built-in functions (`map`, `filter`, `fold`, `len`, `sort`, `to_upper`, etc.)
+- `#` line comments
+- Newline-as-terminator (Go-style)
 
 ## File Extension
 
