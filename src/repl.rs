@@ -1,22 +1,44 @@
-//! Interactive Read-Eval-Print Loop for the Lingo programming language.
+//! Interactive Read-Eval-Print Loop for the Lingo programming language (Lisp dialect).
 
 use std::io::{self, BufRead, Write};
 
 use crate::interpreter::{Interpreter, Value};
-use crate::lexer::Lexer;
-use crate::parser::Parser;
 
 const PRIMARY_PROMPT: &str = ">> ";
 const CONTINUATION_PROMPT: &str = ".. ";
 
-/// Returns true if the parse error indicates unexpected EOF,
-/// meaning the user's input is incomplete and more lines are needed.
-fn is_incomplete_input(error: &str) -> bool {
-    error.contains("None") || error.contains("Eof")
+/// Count unmatched open parens in the input, respecting string literals.
+fn unmatched_parens(input: &str) -> i32 {
+    let mut count: i32 = 0;
+    let mut in_string = false;
+    let mut escape = false;
+
+    for ch in input.chars() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if in_string {
+            if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '(' => count += 1,
+            ')' => count -= 1,
+            ';' => break, // rest of line is a comment
+            _ => {}
+        }
+    }
+    count
 }
 
 /// Start the REPL. Reads lines from stdin, evaluates them, and prints
-/// non-Unit results to stdout. Errors are printed to stderr. The
+/// non-Nil results to stdout. Errors are printed to stderr. The
 /// interpreter state persists across inputs.
 pub fn start() -> Result<(), String> {
     let stdin = io::stdin();
@@ -40,57 +62,34 @@ pub fn start() -> Result<(), String> {
 
         let mut buffer = line;
 
-        loop {
-            let mut lexer = Lexer::new(&buffer);
-            let tokens = match lexer.tokenize() {
-                Ok(tokens) => tokens,
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    break;
-                }
+        // Accumulate lines until parens are balanced
+        while unmatched_parens(&buffer) > 0 {
+            print!("{}", CONTINUATION_PROMPT);
+            stdout.flush().map_err(|e| e.to_string())?;
+
+            let next_line = match reader.next() {
+                Some(Ok(line)) => line,
+                Some(Err(e)) => return Err(e.to_string()),
+                None => break, // EOF during multi-line
             };
 
-            let mut parser = Parser::new(tokens);
-            match parser.parse_program() {
-                Ok(program) => {
-                    for item in &program.items {
-                        match interpreter.eval_item(item) {
-                            Ok(value) => {
-                                if !matches!(value, Value::Unit) {
-                                    println!("{}", value);
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("Error: {}", e);
-                            }
-                        }
-                    }
-                    break;
+            if next_line.trim().is_empty() {
+                // Empty line cancels multi-line input
+                break;
+            }
+
+            buffer.push('\n');
+            buffer.push_str(&next_line);
+        }
+
+        match interpreter.eval_source(&buffer) {
+            Ok(value) => {
+                if !matches!(value, Value::Nil) {
+                    println!("{}", value);
                 }
-                Err(e) => {
-                    if is_incomplete_input(&e) {
-                        print!("{}", CONTINUATION_PROMPT);
-                        stdout.flush().map_err(|e| e.to_string())?;
-
-                        let next_line = match reader.next() {
-                            Some(Ok(line)) => line,
-                            Some(Err(e)) => return Err(e.to_string()),
-                            None => break, // EOF during multi-line
-                        };
-
-                        if next_line.trim().is_empty() {
-                            // Empty line cancels multi-line input
-                            break;
-                        }
-
-                        buffer.push('\n');
-                        buffer.push_str(&next_line);
-                        // Continue the inner loop to re-parse
-                    } else {
-                        eprintln!("Error: {}", e);
-                        break;
-                    }
-                }
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
             }
         }
     }

@@ -3,8 +3,6 @@ use std::fs;
 use std::process;
 
 use lingo::interpreter;
-use lingo::lexer;
-use lingo::parser;
 use lingo::repl;
 use lingo::test_runner;
 
@@ -53,27 +51,12 @@ fn read_file(filename: &str) -> String {
 }
 
 fn run(source: &str) -> Result<(), String> {
-    let mut lexer = lexer::Lexer::new(source);
-    let tokens = lexer.tokenize()?;
-
-    let mut parser = parser::Parser::new(tokens);
-    let program = parser.parse_program()?;
-
     let mut interpreter = interpreter::Interpreter::new();
-    interpreter.run(&program)?;
-
-    Ok(())
+    interpreter.run(source)
 }
 
 fn run_tests(source: &str) -> Result<(), String> {
-    let mut lexer = lexer::Lexer::new(source);
-    let tokens = lexer.tokenize()?;
-
-    let mut parser = parser::Parser::new(tokens);
-    let program = parser.parse_program()?;
-
     let mut interpreter = interpreter::Interpreter::new();
-    interpreter.load_declarations(&program);
-
+    interpreter.load_source(source);
     test_runner::run_test_mode(&mut interpreter)
 }

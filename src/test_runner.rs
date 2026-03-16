@@ -1,7 +1,7 @@
-/// Test runner for the Lingo programming language.
-///
-/// Discovers `test_*` functions, executes each in an isolated environment,
-/// and reports results with pass/fail counts.
+//! Test runner for the Lingo programming language (Lisp dialect).
+//!
+//! Discovers `test-*` functions, executes each in an isolated environment,
+//! and reports results with pass/fail counts.
 
 use crate::interpreter::{Interpreter, Value};
 
@@ -17,18 +17,18 @@ struct TestFailure {
     message: String,
 }
 
-/// Discover all `test_*` function names in the interpreter's environment.
+/// Discover all `test-*` function names in the interpreter's environment.
 /// Returns names sorted alphabetically for deterministic ordering.
 pub fn discover_tests(interpreter: &Interpreter) -> Vec<String> {
     let mut test_names: Vec<String> = interpreter
         .env
         .binding_names()
         .into_iter()
-        .filter(|name| name.starts_with("test_"))
+        .filter(|name| name.starts_with("test-"))
         .filter(|name| {
             matches!(
                 interpreter.env.get(name),
-                Some(Value::Fn { .. })
+                Some(Value::Lambda { .. })
             )
         })
         .collect();

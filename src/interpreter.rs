@@ -1,31 +1,33 @@
-/// Tree-walking evaluator for the Lingo programming language.
+//! Tree-walking evaluator for the Lingo programming language (Lisp dialect).
+//!
+//! Implements the evaluate/apply model with S-expression syntax.
 
 use std::collections::HashMap;
 use std::fmt;
 
-use crate::ast::*;
+use crate::ast::Expr;
 
-#[derive(Debug, Clone)]
+// ---------------------------------------------------------------------------
+// Section A: Value enum and Env
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
 pub enum Value {
     Int(i64),
     Float(f64),
     Str(String),
     Bool(bool),
-    Unit,
-    Tuple(Vec<Value>),
+    Nil,
     List(Vec<Value>),
-    Fn {
-        name: String,
-        params: Vec<Param>,
-        body: Block,
-        closure: Env,
-    },
     Lambda {
-        params: Vec<Param>,
-        body: Box<Expr>,
+        params: Vec<String>,
+        body: Vec<Expr>,
         closure: Env,
     },
-    BuiltinFn(String),
+    Builtin {
+        name: String,
+        func: fn(&[Value]) -> Result<Value, String>,
+    },
 }
 
 impl fmt::Display for Value {
@@ -41,51 +43,67 @@ impl fmt::Display for Value {
             }
             Value::Str(s) => write!(f, "{}", s),
             Value::Bool(b) => write!(f, "{}", b),
-            Value::Unit => write!(f, "()"),
-            Value::Tuple(vals) => {
+            Value::Nil => write!(f, "nil"),
+            Value::List(vals) => {
                 write!(f, "(")?;
                 for (i, v) in vals.iter().enumerate() {
                     if i > 0 {
-                        write!(f, ", ")?;
+                        write!(f, " ")?;
                     }
                     write!(f, "{}", v)?;
                 }
                 write!(f, ")")
             }
-            Value::List(vals) => {
-                write!(f, "[")?;
-                for (i, v) in vals.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{}", v)?;
-                }
-                write!(f, "]")
-            }
-            Value::Fn { name, .. } => write!(f, "<fn {}>", name),
             Value::Lambda { .. } => write!(f, "<lambda>"),
-            Value::BuiltinFn(name) => write!(f, "<builtin {}>", name),
+            Value::Builtin { name, .. } => write!(f, "<builtin:{}>", name),
         }
     }
 }
 
-impl Value {
-    pub fn is_truthy(&self) -> bool {
+impl fmt::Debug for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Value::Bool(b) => *b,
-            Value::Int(n) => *n != 0,
-            Value::Str(s) => !s.is_empty(),
-            Value::Unit => false,
-            Value::List(l) => !l.is_empty(),
-            _ => true,
+            Value::Int(n) => write!(f, "Int({})", n),
+            Value::Float(n) => write!(f, "Float({})", n),
+            Value::Str(s) => write!(f, "Str({:?})", s),
+            Value::Bool(b) => write!(f, "Bool({})", b),
+            Value::Nil => write!(f, "Nil"),
+            Value::List(vals) => write!(f, "List({:?})", vals),
+            Value::Lambda { params, .. } => write!(f, "Lambda({:?})", params),
+            Value::Builtin { name, .. } => write!(f, "Builtin({})", name),
         }
     }
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Int(a), Value::Int(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a == b,
+            (Value::Str(a), Value::Str(b)) => a == b,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Nil, Value::Nil) => true,
+            (Value::List(a), Value::List(b)) => a == b,
+            (Value::Builtin { name: a, .. }, Value::Builtin { name: b, .. }) => a == b,
+            _ => false,
+        }
+    }
+}
+
+fn is_truthy(val: &Value) -> bool {
+    !matches!(val, Value::Bool(false) | Value::Int(0) | Value::Nil)
 }
 
 #[derive(Debug, Clone)]
 pub struct Env {
     bindings: HashMap<String, Value>,
     parent: Option<Box<Env>>,
+}
+
+impl Default for Env {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Env {
@@ -96,10 +114,10 @@ impl Env {
         }
     }
 
-    pub fn child(parent: &Env) -> Self {
+    pub fn child(&self) -> Self {
         Env {
             bindings: HashMap::new(),
-            parent: Some(Box::new(parent.clone())),
+            parent: Some(Box::new(self.clone())),
         }
     }
 
@@ -117,1345 +135,1622 @@ impl Env {
         }
     }
 
-    /// Return names of all bindings in the current scope (not parents).
-    pub fn binding_names(&self) -> Vec<String> {
-        self.bindings.keys().cloned().collect()
-    }
-
-    pub fn update(&mut self, name: &str, value: Value) -> bool {
+    pub fn update(&mut self, name: &str, value: Value) -> Result<(), String> {
         if self.bindings.contains_key(name) {
             self.bindings.insert(name.to_string(), value);
-            true
+            Ok(())
         } else if let Some(parent) = &mut self.parent {
             parent.update(name, value)
         } else {
-            false
+            Err(format!("Undefined variable: {}", name))
+        }
+    }
+
+    pub fn binding_names(&self) -> Vec<String> {
+        self.bindings.keys().cloned().collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Section B: Core evaluator
+// ---------------------------------------------------------------------------
+
+pub fn evaluate(expr: &Expr, env: &mut Env) -> Result<Value, String> {
+    match expr {
+        Expr::Int(n) => Ok(Value::Int(*n)),
+        Expr::Float(f) => Ok(Value::Float(*f)),
+        Expr::Str(s) => Ok(Value::Str(s.clone())),
+        Expr::Bool(b) => Ok(Value::Bool(*b)),
+        Expr::Nil => Ok(Value::Nil),
+        Expr::Symbol(name) => env
+            .get(name)
+            .ok_or_else(|| format!("Undefined variable: {}", name)),
+        Expr::List(elems) => {
+            if elems.is_empty() {
+                return Ok(Value::Nil);
+            }
+            // Check for special forms
+            if let Expr::Symbol(head) = &elems[0] {
+                match head.as_str() {
+                    "def" => return eval_define(&elems[1..], env),
+                    "defn" => return eval_defn(&elems[1..], env),
+                    "fn" => return eval_fn(&elems[1..], env),
+                    "if" => return eval_if(&elems[1..], env),
+                    "cond" => return eval_cond(&elems[1..], env),
+                    "let" => return eval_let(&elems[1..], env),
+                    "do" => return eval_begin(&elems[1..], env),
+                    "quote" => return eval_quote(&elems[1..]),
+                    "set" => return eval_set(&elems[1..], env),
+                    "and" => return eval_and(&elems[1..], env),
+                    "or" => return eval_or(&elems[1..], env),
+                    "while" => return eval_while(&elems[1..], env),
+                    "match" => return eval_match(&elems[1..], env),
+                    "->" => return eval_thread(&elems[1..], env),
+                    _ => {}
+                }
+            }
+            // General function application: evaluate all, apply head to rest
+            let vals: Vec<Value> = elems
+                .iter()
+                .map(|e| evaluate(e, env))
+                .collect::<Result<Vec<_>, _>>()?;
+            let (func, args) = vals.split_first().unwrap();
+            apply_function(func, args)
         }
     }
 }
 
-/// Control flow signals
-enum Signal {
-    Return(Value),
-    Break,
+pub fn apply_function(func: &Value, args: &[Value]) -> Result<Value, String> {
+    call_value(func, args)
 }
 
+/// Shared helper that both `apply_function` and higher-order builtins use.
+pub fn call_value(func: &Value, args: &[Value]) -> Result<Value, String> {
+    match func {
+        Value::Lambda {
+            params,
+            body,
+            closure,
+        } => {
+            if args.len() != params.len() {
+                return Err(format!(
+                    "Expected {} arguments, got {}",
+                    params.len(),
+                    args.len()
+                ));
+            }
+            let mut local = closure.child();
+            for (param, arg) in params.iter().zip(args.iter()) {
+                local.set(param.clone(), arg.clone());
+            }
+            let mut result = Value::Nil;
+            for expr in body {
+                result = evaluate(expr, &mut local)?;
+            }
+            Ok(result)
+        }
+        Value::Builtin { func, .. } => func(args),
+        other => Err(format!("Not a function: {}", other)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Section C: Special form handlers
+// ---------------------------------------------------------------------------
+
+/// `(def name expr)`
+fn eval_define(args: &[Expr], env: &mut Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("def requires exactly 2 arguments".to_string());
+    }
+    let name = args[0].as_symbol()?.to_string();
+    let value = evaluate(&args[1], env)?;
+    env.set(name, value);
+    Ok(Value::Nil)
+}
+
+/// `(defn name (params) body...)`
+fn eval_defn(args: &[Expr], env: &mut Env) -> Result<Value, String> {
+    if args.len() < 3 {
+        return Err("defn requires name, params, and body".to_string());
+    }
+    let name = args[0].as_symbol()?.to_string();
+    let param_exprs = args[1].as_list()?;
+    let params: Vec<String> = param_exprs
+        .iter()
+        .map(|p| p.as_symbol().map(|s| s.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let body: Vec<Expr> = args[2..].to_vec();
+    let lambda = Value::Lambda {
+        params,
+        body,
+        closure: env.clone(),
+    };
+    env.set(name, lambda);
+    Ok(Value::Nil)
+}
+
+/// `(fn (params) body...)`
+fn eval_fn(args: &[Expr], env: &mut Env) -> Result<Value, String> {
+    if args.len() < 2 {
+        return Err("fn requires params and body".to_string());
+    }
+    let param_exprs = args[0].as_list()?;
+    let params: Vec<String> = param_exprs
+        .iter()
+        .map(|p| p.as_symbol().map(|s| s.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let body: Vec<Expr> = args[1..].to_vec();
+    Ok(Value::Lambda {
+        params,
+        body,
+        closure: env.clone(),
+    })
+}
+
+/// `(if test then [else])`
+fn eval_if(args: &[Expr], env: &mut Env) -> Result<Value, String> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err("if requires 2 or 3 arguments".to_string());
+    }
+    let test = evaluate(&args[0], env)?;
+    if is_truthy(&test) {
+        evaluate(&args[1], env)
+    } else if args.len() == 3 {
+        evaluate(&args[2], env)
+    } else {
+        Ok(Value::Nil)
+    }
+}
+
+/// `(cond (test1 expr1) ... (else exprN))`
+fn eval_cond(args: &[Expr], env: &mut Env) -> Result<Value, String> {
+    for clause in args {
+        let elems = clause.as_list()?;
+        if elems.len() != 2 {
+            return Err("cond clause must have exactly 2 elements".to_string());
+        }
+        // Check for `else` keyword
+        if let Expr::Symbol(s) = &elems[0]
+            && s == "else"
+        {
+            return evaluate(&elems[1], env);
+        }
+        let test = evaluate(&elems[0], env)?;
+        if is_truthy(&test) {
+            return evaluate(&elems[1], env);
+        }
+    }
+    Ok(Value::Nil)
+}
+
+/// `(let ((x 1) (y 2)) body...)`
+fn eval_let(args: &[Expr], env: &mut Env) -> Result<Value, String> {
+    if args.len() < 2 {
+        return Err("let requires bindings and body".to_string());
+    }
+    let bindings = args[0].as_list()?;
+    let mut local = env.child();
+    for binding in bindings {
+        let pair = binding.as_list()?;
+        if pair.len() != 2 {
+            return Err("let binding must have exactly 2 elements".to_string());
+        }
+        let name = pair[0].as_symbol()?.to_string();
+        let value = evaluate(&pair[1], &mut local)?;
+        local.set(name, value);
+    }
+    let mut result = Value::Nil;
+    for expr in &args[1..] {
+        result = evaluate(expr, &mut local)?;
+    }
+    Ok(result)
+}
+
+/// `(do e1 e2 ... en)`
+fn eval_begin(args: &[Expr], env: &mut Env) -> Result<Value, String> {
+    let mut result = Value::Nil;
+    for expr in args {
+        result = evaluate(expr, env)?;
+    }
+    Ok(result)
+}
+
+/// `(quote expr)` -- return expr as data
+fn eval_quote(args: &[Expr]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("quote requires exactly 1 argument".to_string());
+    }
+    Ok(expr_to_value(&args[0]))
+}
+
+/// Convert an Expr tree to a Value tree for `quote`.
+fn expr_to_value(expr: &Expr) -> Value {
+    match expr {
+        Expr::Int(n) => Value::Int(*n),
+        Expr::Float(f) => Value::Float(*f),
+        Expr::Str(s) => Value::Str(s.clone()),
+        Expr::Bool(b) => Value::Bool(*b),
+        Expr::Nil => Value::Nil,
+        Expr::Symbol(s) => Value::Str(s.clone()),
+        Expr::List(elems) => Value::List(elems.iter().map(expr_to_value).collect()),
+    }
+}
+
+/// `(set name expr)` -- mutate existing binding
+fn eval_set(args: &[Expr], env: &mut Env) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("set requires exactly 2 arguments".to_string());
+    }
+    let name = args[0].as_symbol()?;
+    let value = evaluate(&args[1], env)?;
+    env.update(name, value)?;
+    Ok(Value::Nil)
+}
+
+/// `(and a b c)` -- short-circuit, return last truthy or first falsy
+fn eval_and(args: &[Expr], env: &mut Env) -> Result<Value, String> {
+    let mut result = Value::Bool(true);
+    for expr in args {
+        result = evaluate(expr, env)?;
+        if !is_truthy(&result) {
+            return Ok(result);
+        }
+    }
+    Ok(result)
+}
+
+/// `(or a b c)` -- short-circuit, return first truthy or last falsy
+fn eval_or(args: &[Expr], env: &mut Env) -> Result<Value, String> {
+    let mut result = Value::Bool(false);
+    for expr in args {
+        result = evaluate(expr, env)?;
+        if is_truthy(&result) {
+            return Ok(result);
+        }
+    }
+    Ok(result)
+}
+
+/// `(while test body...)` -- loop while test is truthy, return Nil
+fn eval_while(args: &[Expr], env: &mut Env) -> Result<Value, String> {
+    if args.is_empty() {
+        return Err("while requires a test and body".to_string());
+    }
+    let test = &args[0];
+    let body = &args[1..];
+    loop {
+        let cond = evaluate(test, env)?;
+        if !is_truthy(&cond) {
+            break;
+        }
+        for expr in body {
+            evaluate(expr, env)?;
+        }
+    }
+    Ok(Value::Nil)
+}
+
+/// `(match expr (pattern1 result1) ... (_ default))`
+fn eval_match(args: &[Expr], env: &mut Env) -> Result<Value, String> {
+    if args.len() < 2 {
+        return Err("match requires scrutinee and at least one arm".to_string());
+    }
+    let scrutinee = evaluate(&args[0], env)?;
+    for arm in &args[1..] {
+        let elems = arm.as_list()?;
+        if elems.len() != 2 {
+            return Err("match arm must have exactly 2 elements".to_string());
+        }
+        let pattern = &elems[0];
+        let result = &elems[1];
+        if match_pattern(pattern, &scrutinee, env)? {
+            return evaluate(result, env);
+        }
+    }
+    Err(format!("No matching pattern for value: {}", scrutinee))
+}
+
+/// Check if a pattern matches a value. Supports literal and wildcard patterns.
+fn match_pattern(pattern: &Expr, value: &Value, _env: &mut Env) -> Result<bool, String> {
+    match pattern {
+        Expr::Symbol(s) if s == "_" => Ok(true),
+        Expr::Int(n) => Ok(matches!(value, Value::Int(v) if v == n)),
+        Expr::Float(f) => Ok(matches!(value, Value::Float(v) if v == f)),
+        Expr::Str(s) => Ok(matches!(value, Value::Str(v) if v == s)),
+        Expr::Bool(b) => Ok(matches!(value, Value::Bool(v) if v == b)),
+        Expr::Nil => Ok(matches!(value, Value::Nil)),
+        _ => Err(format!("Unsupported match pattern: {}", pattern)),
+    }
+}
+
+/// `(-> val (f a b) (g c))` desugars to `(g (f val a b) c)`
+fn eval_thread(args: &[Expr], env: &mut Env) -> Result<Value, String> {
+    if args.is_empty() {
+        return Err("-> requires at least one argument".to_string());
+    }
+    let mut result = evaluate(&args[0], env)?;
+    for step in &args[1..] {
+        match step {
+            Expr::List(elems) => {
+                if elems.is_empty() {
+                    return Err("-> step cannot be an empty list".to_string());
+                }
+                // Evaluate the function
+                let func = evaluate(&elems[0], env)?;
+                // Build args: result is first arg, then the rest
+                let mut call_args = vec![result];
+                for arg_expr in &elems[1..] {
+                    call_args.push(evaluate(arg_expr, env)?);
+                }
+                result = call_value(&func, &call_args)?;
+            }
+            Expr::Symbol(_) => {
+                // Bare symbol: call as unary function
+                let func = evaluate(step, env)?;
+                result = call_value(&func, &[result])?;
+            }
+            _ => return Err(format!("-> step must be a list or symbol, got: {}", step)),
+        }
+    }
+    Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// Section D: Builtin functions
+// ---------------------------------------------------------------------------
+
+type BuiltinFn = fn(&[Value]) -> Result<Value, String>;
+
+fn register_builtins(env: &mut Env) {
+    let builtins: Vec<(&str, BuiltinFn)> = vec![
+        // Arithmetic
+        ("+", builtin_add),
+        ("-", builtin_sub),
+        ("*", builtin_mul),
+        ("/", builtin_div),
+        ("mod", builtin_mod),
+        ("abs", builtin_abs),
+        ("min", builtin_min),
+        ("max", builtin_max),
+        // Comparison
+        ("=", builtin_eq),
+        ("<", builtin_lt),
+        (">", builtin_gt),
+        ("<=", builtin_le),
+        (">=", builtin_ge),
+        // Logic
+        ("not", builtin_not),
+        // List
+        ("list", builtin_list),
+        ("cons", builtin_cons),
+        ("first", builtin_first),
+        ("rest", builtin_rest),
+        ("nth", builtin_nth),
+        ("len", builtin_length),
+        ("cat", builtin_append),
+        ("rev", builtin_reverse),
+        ("map", builtin_map),
+        ("filter", builtin_filter),
+        ("fold", builtin_fold),
+        ("each", builtin_for_each),
+        ("flat", builtin_flatten),
+        ("zip", builtin_zip),
+        ("take", builtin_take),
+        ("drop", builtin_drop),
+        ("sort", builtin_sort),
+        ("sortby", builtin_sort_by),
+        ("any", builtin_any),
+        ("all", builtin_all),
+        ("find", builtin_find),
+        ("uniq", builtin_unique),
+        ("chunk", builtin_chunk),
+        ("enumerate", builtin_enumerate),
+        ("groupby", builtin_group_by),
+        ("range", builtin_range),
+        // String
+        ("str", builtin_str),
+        ("strlen", builtin_string_length),
+        ("substring", builtin_substring),
+        ("split", builtin_split),
+        ("join", builtin_join),
+        ("trim", builtin_trim),
+        ("has", builtin_contains),
+        ("replace", builtin_replace),
+        ("starts-with", builtin_starts_with),
+        ("ends-with", builtin_ends_with),
+        ("upcase", builtin_upper_case),
+        ("downcase", builtin_lower_case),
+        // Type
+        ("type-of", builtin_type_of),
+        ("int?", builtin_is_int),
+        ("float?", builtin_is_float),
+        ("string?", builtin_is_string),
+        ("bool?", builtin_is_bool),
+        ("list?", builtin_is_list),
+        ("nil?", builtin_is_nil),
+        ("number?", builtin_is_number),
+        // Conversion
+        ("->int", builtin_to_int),
+        ("->float", builtin_to_float),
+        ("->str", builtin_to_str),
+        // I/O
+        ("println", builtin_println),
+        ("print", builtin_print),
+        ("readline", builtin_read_line),
+        ("readfile", builtin_read_file),
+        ("writefile", builtin_write_file),
+        // Debug/Test
+        ("dbg", builtin_dbg),
+        ("assert", builtin_assert),
+        ("assert-eq", builtin_assert_eq),
+        ("assert-ne", builtin_assert_ne),
+        ("assert-true", builtin_assert_true),
+        ("assert-false", builtin_assert_false),
+    ];
+
+    for (name, func) in builtins {
+        env.set(
+            name.to_string(),
+            Value::Builtin {
+                name: name.to_string(),
+                func,
+            },
+        );
+    }
+}
+
+// -- Arithmetic builtins --
+
+fn builtin_add(args: &[Value]) -> Result<Value, String> {
+    if args.is_empty() {
+        return Ok(Value::Int(0));
+    }
+    let mut result = args[0].clone();
+    for arg in &args[1..] {
+        result = numeric_op(&result, arg, "+", |a, b| a + b, |a, b| a + b)?;
+    }
+    Ok(result)
+}
+
+fn builtin_sub(args: &[Value]) -> Result<Value, String> {
+    if args.is_empty() {
+        return Err("- requires at least 1 argument".to_string());
+    }
+    if args.len() == 1 {
+        // Unary negate
+        return match &args[0] {
+            Value::Int(n) => Ok(Value::Int(-n)),
+            Value::Float(f) => Ok(Value::Float(-f)),
+            other => Err(format!("Cannot negate: {}", other)),
+        };
+    }
+    let mut result = args[0].clone();
+    for arg in &args[1..] {
+        result = numeric_op(&result, arg, "-", |a, b| a - b, |a, b| a - b)?;
+    }
+    Ok(result)
+}
+
+fn builtin_mul(args: &[Value]) -> Result<Value, String> {
+    if args.is_empty() {
+        return Ok(Value::Int(1));
+    }
+    let mut result = args[0].clone();
+    for arg in &args[1..] {
+        result = numeric_op(&result, arg, "*", |a, b| a * b, |a, b| a * b)?;
+    }
+    Ok(result)
+}
+
+fn builtin_div(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("/ requires exactly 2 arguments".to_string());
+    }
+    // Check for division by zero
+    match &args[1] {
+        Value::Int(0) => return Err("Division by zero".to_string()),
+        Value::Float(f) if *f == 0.0 => return Err("Division by zero".to_string()),
+        _ => {}
+    }
+    numeric_op(&args[0], &args[1], "/", |a, b| a / b, |a, b| a / b)
+}
+
+fn builtin_mod(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("% requires exactly 2 arguments".to_string());
+    }
+    if let Value::Int(0) = &args[1] {
+        return Err("Modulo by zero".to_string());
+    }
+    numeric_op(&args[0], &args[1], "mod", |a, b| a % b, |a, b| a % b)
+}
+
+fn builtin_abs(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("abs requires exactly 1 argument".to_string());
+    }
+    match &args[0] {
+        Value::Int(n) => Ok(Value::Int(n.abs())),
+        Value::Float(f) => Ok(Value::Float(f.abs())),
+        other => Err(format!("abs: expected number, got {}", other)),
+    }
+}
+
+fn builtin_min(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("min requires exactly 2 arguments".to_string());
+    }
+    let ord = compare_values(&args[0], &args[1])?;
+    if ord == std::cmp::Ordering::Less || ord == std::cmp::Ordering::Equal {
+        Ok(args[0].clone())
+    } else {
+        Ok(args[1].clone())
+    }
+}
+
+fn builtin_max(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("max requires exactly 2 arguments".to_string());
+    }
+    let ord = compare_values(&args[0], &args[1])?;
+    if ord == std::cmp::Ordering::Greater || ord == std::cmp::Ordering::Equal {
+        Ok(args[0].clone())
+    } else {
+        Ok(args[1].clone())
+    }
+}
+
+fn numeric_op(
+    a: &Value,
+    b: &Value,
+    op_name: &str,
+    int_op: fn(i64, i64) -> i64,
+    float_op: fn(f64, f64) -> f64,
+) -> Result<Value, String> {
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => Ok(Value::Int(int_op(*x, *y))),
+        (Value::Float(x), Value::Float(y)) => Ok(Value::Float(float_op(*x, *y))),
+        (Value::Int(x), Value::Float(y)) => Ok(Value::Float(float_op(*x as f64, *y))),
+        (Value::Float(x), Value::Int(y)) => Ok(Value::Float(float_op(*x, *y as f64))),
+        _ => Err(format!("{}: expected numbers, got {} and {}", op_name, a, b)),
+    }
+}
+
+fn compare_values(a: &Value, b: &Value) -> Result<std::cmp::Ordering, String> {
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => Ok(x.cmp(y)),
+        (Value::Float(x), Value::Float(y)) => x
+            .partial_cmp(y)
+            .ok_or_else(|| "Cannot compare NaN".to_string()),
+        (Value::Int(x), Value::Float(y)) => (*x as f64)
+            .partial_cmp(y)
+            .ok_or_else(|| "Cannot compare NaN".to_string()),
+        (Value::Float(x), Value::Int(y)) => x
+            .partial_cmp(&(*y as f64))
+            .ok_or_else(|| "Cannot compare NaN".to_string()),
+        (Value::Str(x), Value::Str(y)) => Ok(x.cmp(y)),
+        _ => Err(format!("Cannot compare {} and {}", a, b)),
+    }
+}
+
+// -- Comparison builtins --
+
+fn builtin_eq(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("= requires exactly 2 arguments".to_string());
+    }
+    Ok(Value::Bool(args[0] == args[1]))
+}
+
+fn builtin_lt(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("< requires exactly 2 arguments".to_string());
+    }
+    Ok(Value::Bool(
+        compare_values(&args[0], &args[1])? == std::cmp::Ordering::Less,
+    ))
+}
+
+fn builtin_gt(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("> requires exactly 2 arguments".to_string());
+    }
+    Ok(Value::Bool(
+        compare_values(&args[0], &args[1])? == std::cmp::Ordering::Greater,
+    ))
+}
+
+fn builtin_le(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("<= requires exactly 2 arguments".to_string());
+    }
+    Ok(Value::Bool(
+        compare_values(&args[0], &args[1])? != std::cmp::Ordering::Greater,
+    ))
+}
+
+fn builtin_ge(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(">= requires exactly 2 arguments".to_string());
+    }
+    Ok(Value::Bool(
+        compare_values(&args[0], &args[1])? != std::cmp::Ordering::Less,
+    ))
+}
+
+// -- Logic builtins --
+
+fn builtin_not(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("not requires exactly 1 argument".to_string());
+    }
+    Ok(Value::Bool(!is_truthy(&args[0])))
+}
+
+// -- List builtins --
+
+fn builtin_list(args: &[Value]) -> Result<Value, String> {
+    Ok(Value::List(args.to_vec()))
+}
+
+fn builtin_cons(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("cons requires exactly 2 arguments".to_string());
+    }
+    match &args[1] {
+        Value::List(list) => {
+            let mut new = vec![args[0].clone()];
+            new.extend(list.iter().cloned());
+            Ok(Value::List(new))
+        }
+        _ => Err(format!("cons: second argument must be a list, got {}", args[1])),
+    }
+}
+
+fn builtin_first(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("first requires exactly 1 argument".to_string());
+    }
+    match &args[0] {
+        Value::List(list) => {
+            if list.is_empty() {
+                Ok(Value::Nil)
+            } else {
+                Ok(list[0].clone())
+            }
+        }
+        _ => Err(format!("first: expected list, got {}", args[0])),
+    }
+}
+
+fn builtin_rest(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("rest requires exactly 1 argument".to_string());
+    }
+    match &args[0] {
+        Value::List(list) => {
+            if list.is_empty() {
+                Ok(Value::List(vec![]))
+            } else {
+                Ok(Value::List(list[1..].to_vec()))
+            }
+        }
+        _ => Err(format!("rest: expected list, got {}", args[0])),
+    }
+}
+
+fn builtin_nth(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("nth requires exactly 2 arguments".to_string());
+    }
+    match (&args[0], &args[1]) {
+        (Value::List(list), Value::Int(i)) => {
+            let idx = *i as usize;
+            if idx < list.len() {
+                Ok(list[idx].clone())
+            } else {
+                Err(format!("nth: index {} out of bounds for list of length {}", i, list.len()))
+            }
+        }
+        _ => Err(format!("nth: expected (list, int), got ({}, {})", args[0], args[1])),
+    }
+}
+
+fn builtin_length(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("len requires exactly 1 argument".to_string());
+    }
+    match &args[0] {
+        Value::List(list) => Ok(Value::Int(list.len() as i64)),
+        Value::Str(s) => Ok(Value::Int(s.len() as i64)),
+        _ => Err(format!("len: expected list or string, got {}", args[0])),
+    }
+}
+
+fn builtin_append(args: &[Value]) -> Result<Value, String> {
+    let mut result = Vec::new();
+    for arg in args {
+        match arg {
+            Value::List(list) => result.extend(list.iter().cloned()),
+            _ => return Err(format!("cat: expected list, got {}", arg)),
+        }
+    }
+    Ok(Value::List(result))
+}
+
+fn builtin_reverse(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("rev requires exactly 1 argument".to_string());
+    }
+    match &args[0] {
+        Value::List(list) => {
+            let mut rev = list.clone();
+            rev.reverse();
+            Ok(Value::List(rev))
+        }
+        _ => Err(format!("rev: expected list, got {}", args[0])),
+    }
+}
+
+fn builtin_map(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("map requires exactly 2 arguments (list, function)".to_string());
+    }
+    // Accept either (list, fn) or (fn, list) for flexibility
+    let (func, list) = match (&args[0], &args[1]) {
+        (Value::List(l), f @ (Value::Lambda { .. } | Value::Builtin { .. })) => (f, l),
+        (f @ (Value::Lambda { .. } | Value::Builtin { .. }), Value::List(l)) => (f, l),
+        _ => return Err(format!("map: expected a list and a function, got {} and {}", args[0], args[1])),
+    };
+    let mut result = Vec::new();
+    for item in list {
+        result.push(call_value(func, std::slice::from_ref(item))?);
+    }
+    Ok(Value::List(result))
+}
+
+fn builtin_filter(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("filter requires exactly 2 arguments (list, predicate)".to_string());
+    }
+    let (func, list) = match (&args[0], &args[1]) {
+        (Value::List(l), f @ (Value::Lambda { .. } | Value::Builtin { .. })) => (f, l),
+        (f @ (Value::Lambda { .. } | Value::Builtin { .. }), Value::List(l)) => (f, l),
+        _ => return Err(format!("filter: expected a list and a function, got {} and {}", args[0], args[1])),
+    };
+    let mut result = Vec::new();
+    for item in list {
+        let val = call_value(func, std::slice::from_ref(item))?;
+        if is_truthy(&val) {
+            result.push(item.clone());
+        }
+    }
+    Ok(Value::List(result))
+}
+
+fn builtin_fold(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err("fold requires exactly 3 arguments".to_string());
+    }
+    // Accept (list, initial, function) or (initial, function, list)
+    let (acc_init, func, list) = match (&args[0], &args[1], &args[2]) {
+        (Value::List(l), init, f @ (Value::Lambda { .. } | Value::Builtin { .. })) => {
+            (init.clone(), f, l.clone())
+        }
+        (init, f @ (Value::Lambda { .. } | Value::Builtin { .. }), Value::List(l)) => {
+            (init.clone(), f, l.clone())
+        }
+        _ => return Err("fold: expected a list, initial value, and function".to_string()),
+    };
+    let mut acc = acc_init;
+    for item in &list {
+        acc = call_value(func, &[acc, item.clone()])?;
+    }
+    Ok(acc)
+}
+
+fn builtin_for_each(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("each requires exactly 2 arguments (function, list)".to_string());
+    }
+    let (func, list) = match (&args[0], &args[1]) {
+        (Value::List(l), f @ (Value::Lambda { .. } | Value::Builtin { .. })) => (f, l),
+        (f @ (Value::Lambda { .. } | Value::Builtin { .. }), Value::List(l)) => (f, l),
+        _ => return Err(format!("each: expected a function and a list, got {} and {}", args[0], args[1])),
+    };
+    for item in list {
+        call_value(func, std::slice::from_ref(item))?;
+    }
+    Ok(Value::Nil)
+}
+
+fn builtin_flatten(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("flat requires exactly 1 argument".to_string());
+    }
+    match &args[0] {
+        Value::List(list) => {
+            let mut result = Vec::new();
+            for item in list {
+                match item {
+                    Value::List(inner) => result.extend(inner.iter().cloned()),
+                    other => result.push(other.clone()),
+                }
+            }
+            Ok(Value::List(result))
+        }
+        _ => Err(format!("flat: expected list, got {}", args[0])),
+    }
+}
+
+fn builtin_zip(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("zip requires exactly 2 arguments".to_string());
+    }
+    match (&args[0], &args[1]) {
+        (Value::List(a), Value::List(b)) => {
+            let result: Vec<Value> = a
+                .iter()
+                .zip(b.iter())
+                .map(|(x, y)| Value::List(vec![x.clone(), y.clone()]))
+                .collect();
+            Ok(Value::List(result))
+        }
+        _ => Err(format!("zip: expected two lists, got {} and {}", args[0], args[1])),
+    }
+}
+
+fn builtin_take(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("take requires exactly 2 arguments (n, list)".to_string());
+    }
+    match (&args[0], &args[1]) {
+        (Value::Int(n), Value::List(list)) => {
+            let n = (*n).max(0) as usize;
+            Ok(Value::List(list.iter().take(n).cloned().collect()))
+        }
+        _ => Err(format!("take: expected (int, list), got ({}, {})", args[0], args[1])),
+    }
+}
+
+fn builtin_drop(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("drop requires exactly 2 arguments (n, list)".to_string());
+    }
+    match (&args[0], &args[1]) {
+        (Value::Int(n), Value::List(list)) => {
+            let n = (*n).max(0) as usize;
+            Ok(Value::List(list.iter().skip(n).cloned().collect()))
+        }
+        _ => Err(format!("drop: expected (int, list), got ({}, {})", args[0], args[1])),
+    }
+}
+
+fn builtin_sort(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("sort requires exactly 1 argument".to_string());
+    }
+    match &args[0] {
+        Value::List(list) => {
+            let mut sorted = list.clone();
+            let mut err = None;
+            sorted.sort_by(|a, b| match compare_values(a, b) {
+                Ok(ord) => ord,
+                Err(e) => {
+                    err = Some(e);
+                    std::cmp::Ordering::Equal
+                }
+            });
+            if let Some(e) = err {
+                return Err(e);
+            }
+            Ok(Value::List(sorted))
+        }
+        _ => Err(format!("sort: expected list, got {}", args[0])),
+    }
+}
+
+fn builtin_sort_by(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("sortby requires exactly 2 arguments (list, function)".to_string());
+    }
+    let (func, list_ref) = match (&args[0], &args[1]) {
+        (Value::List(_), f @ (Value::Lambda { .. } | Value::Builtin { .. })) => (f, &args[0]),
+        (f @ (Value::Lambda { .. } | Value::Builtin { .. }), Value::List(_)) => (f, &args[1]),
+        _ => return Err(format!("sortby: expected a list and a function, got {} and {}", args[0], args[1])),
+    };
+    let list = match list_ref {
+        Value::List(l) => l,
+        _ => unreachable!(),
+    };
+    // Map each element through the function, then sort by the result
+    let mut indexed: Vec<(Value, Value)> = list
+        .iter()
+        .map(|item| {
+            let key = call_value(func, std::slice::from_ref(item))?;
+            Ok((item.clone(), key))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    let mut err = None;
+    indexed.sort_by(|(_, ka), (_, kb)| match compare_values(ka, kb) {
+        Ok(ord) => ord,
+        Err(e) => {
+            err = Some(e);
+            std::cmp::Ordering::Equal
+        }
+    });
+    if let Some(e) = err {
+        return Err(e);
+    }
+    Ok(Value::List(indexed.into_iter().map(|(v, _)| v).collect()))
+}
+
+fn builtin_any(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("any requires exactly 2 arguments (list, predicate)".to_string());
+    }
+    let (func, list) = match (&args[0], &args[1]) {
+        (Value::List(l), f @ (Value::Lambda { .. } | Value::Builtin { .. })) => (f, l),
+        (f @ (Value::Lambda { .. } | Value::Builtin { .. }), Value::List(l)) => (f, l),
+        _ => return Err(format!("any: expected a list and a function, got {} and {}", args[0], args[1])),
+    };
+    for item in list {
+        let val = call_value(func, std::slice::from_ref(item))?;
+        if is_truthy(&val) {
+            return Ok(Value::Bool(true));
+        }
+    }
+    Ok(Value::Bool(false))
+}
+
+fn builtin_all(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("all requires exactly 2 arguments (list, predicate)".to_string());
+    }
+    let (func, list) = match (&args[0], &args[1]) {
+        (Value::List(l), f @ (Value::Lambda { .. } | Value::Builtin { .. })) => (f, l),
+        (f @ (Value::Lambda { .. } | Value::Builtin { .. }), Value::List(l)) => (f, l),
+        _ => return Err(format!("all: expected a list and a function, got {} and {}", args[0], args[1])),
+    };
+    for item in list {
+        let val = call_value(func, std::slice::from_ref(item))?;
+        if !is_truthy(&val) {
+            return Ok(Value::Bool(false));
+        }
+    }
+    Ok(Value::Bool(true))
+}
+
+fn builtin_find(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("find requires exactly 2 arguments (list, predicate)".to_string());
+    }
+    let (func, list) = match (&args[0], &args[1]) {
+        (Value::List(l), f @ (Value::Lambda { .. } | Value::Builtin { .. })) => (f, l),
+        (f @ (Value::Lambda { .. } | Value::Builtin { .. }), Value::List(l)) => (f, l),
+        _ => return Err(format!("find: expected a list and a function, got {} and {}", args[0], args[1])),
+    };
+    for item in list {
+        let val = call_value(func, std::slice::from_ref(item))?;
+        if is_truthy(&val) {
+            return Ok(item.clone());
+        }
+    }
+    Ok(Value::Nil)
+}
+
+fn builtin_unique(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("uniq requires exactly 1 argument".to_string());
+    }
+    match &args[0] {
+        Value::List(list) => {
+            let mut seen = Vec::new();
+            let mut result = Vec::new();
+            for item in list {
+                let s = format!("{:?}", item);
+                if !seen.contains(&s) {
+                    seen.push(s);
+                    result.push(item.clone());
+                }
+            }
+            Ok(Value::List(result))
+        }
+        _ => Err(format!("uniq: expected list, got {}", args[0])),
+    }
+}
+
+fn builtin_chunk(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("chunk requires exactly 2 arguments (size, list)".to_string());
+    }
+    match (&args[0], &args[1]) {
+        (Value::Int(n), Value::List(list)) => {
+            if *n <= 0 {
+                return Err("chunk: size must be positive".to_string());
+            }
+            let n = *n as usize;
+            let result: Vec<Value> = list.chunks(n).map(|c| Value::List(c.to_vec())).collect();
+            Ok(Value::List(result))
+        }
+        _ => Err(format!("chunk: expected (int, list), got ({}, {})", args[0], args[1])),
+    }
+}
+
+fn builtin_enumerate(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("enumerate requires exactly 1 argument".to_string());
+    }
+    match &args[0] {
+        Value::List(list) => {
+            let result: Vec<Value> = list
+                .iter()
+                .enumerate()
+                .map(|(i, v)| Value::List(vec![Value::Int(i as i64), v.clone()]))
+                .collect();
+            Ok(Value::List(result))
+        }
+        _ => Err(format!("enum: expected list, got {}", args[0])),
+    }
+}
+
+fn builtin_group_by(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("groupby requires exactly 2 arguments (list, function)".to_string());
+    }
+    let (func, list) = match (&args[0], &args[1]) {
+        (Value::List(l), f @ (Value::Lambda { .. } | Value::Builtin { .. })) => (f, l),
+        (f @ (Value::Lambda { .. } | Value::Builtin { .. }), Value::List(l)) => (f, l),
+        _ => return Err(format!("groupby: expected a list and a function, got {} and {}", args[0], args[1])),
+    };
+    // Group into a list of (key, [values]) pairs preserving insertion order
+    let mut keys: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, (Value, Vec<Value>)> = HashMap::new();
+    for item in list {
+        let key = call_value(func, std::slice::from_ref(item))?;
+        let key_str = format!("{}", key);
+        groups
+            .entry(key_str.clone())
+            .or_insert_with(|| {
+                keys.push(key_str.clone());
+                (key.clone(), Vec::new())
+            })
+            .1
+            .push(item.clone());
+    }
+    let result: Vec<Value> = keys
+        .iter()
+        .map(|k| {
+            let (key, vals) = groups.remove(k).unwrap();
+            Value::List(vec![key, Value::List(vals)])
+        })
+        .collect();
+    Ok(Value::List(result))
+}
+
+fn builtin_range(args: &[Value]) -> Result<Value, String> {
+    match args.len() {
+        1 => match &args[0] {
+            Value::Int(end) => {
+                let list: Vec<Value> = (0..*end).map(Value::Int).collect();
+                Ok(Value::List(list))
+            }
+            _ => Err(format!("range: expected int, got {}", args[0])),
+        },
+        2 => match (&args[0], &args[1]) {
+            (Value::Int(start), Value::Int(end)) => {
+                let list: Vec<Value> = (*start..*end).map(Value::Int).collect();
+                Ok(Value::List(list))
+            }
+            _ => Err(format!(
+                "range: expected (int, int), got ({}, {})",
+                args[0], args[1]
+            )),
+        },
+        3 => match (&args[0], &args[1], &args[2]) {
+            (Value::Int(start), Value::Int(end), Value::Int(step)) => {
+                if *step == 0 {
+                    return Err("range: step cannot be zero".to_string());
+                }
+                let mut list = Vec::new();
+                let mut i = *start;
+                if *step > 0 {
+                    while i < *end {
+                        list.push(Value::Int(i));
+                        i += step;
+                    }
+                } else {
+                    while i > *end {
+                        list.push(Value::Int(i));
+                        i += step;
+                    }
+                }
+                Ok(Value::List(list))
+            }
+            _ => Err(format!(
+                "range: expected (int, int, int), got ({}, {}, {})",
+                args[0], args[1], args[2]
+            )),
+        },
+        _ => Err("range requires 1, 2, or 3 arguments".to_string()),
+    }
+}
+
+// -- String builtins --
+
+fn builtin_str(args: &[Value]) -> Result<Value, String> {
+    let mut result = String::new();
+    for arg in args {
+        result.push_str(&format!("{}", arg));
+    }
+    Ok(Value::Str(result))
+}
+
+fn builtin_string_length(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("strlen requires exactly 1 argument".to_string());
+    }
+    match &args[0] {
+        Value::Str(s) => Ok(Value::Int(s.len() as i64)),
+        _ => Err(format!("strlen: expected string, got {}", args[0])),
+    }
+}
+
+fn builtin_substring(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err("substring requires exactly 3 arguments (string, start, end)".to_string());
+    }
+    match (&args[0], &args[1], &args[2]) {
+        (Value::Str(s), Value::Int(start), Value::Int(end)) => {
+            let start = (*start).max(0) as usize;
+            let end = (*end).min(s.len() as i64).max(0) as usize;
+            if start > end || start > s.len() {
+                Ok(Value::Str(String::new()))
+            } else {
+                Ok(Value::Str(s[start..end].to_string()))
+            }
+        }
+        _ => Err(format!(
+            "substring: expected (string, int, int), got ({}, {}, {})",
+            args[0], args[1], args[2]
+        )),
+    }
+}
+
+fn builtin_split(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("split requires exactly 2 arguments (string, delimiter)".to_string());
+    }
+    match (&args[0], &args[1]) {
+        (Value::Str(s), Value::Str(delim)) => {
+            let parts: Vec<Value> = s.split(delim.as_str()).map(|p| Value::Str(p.to_string())).collect();
+            Ok(Value::List(parts))
+        }
+        _ => Err(format!("split: expected (string, string), got ({}, {})", args[0], args[1])),
+    }
+}
+
+fn builtin_join(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("join requires exactly 2 arguments (separator, list)".to_string());
+    }
+    match (&args[0], &args[1]) {
+        (Value::Str(sep), Value::List(list)) => {
+            let parts: Vec<String> = list.iter().map(|v| format!("{}", v)).collect();
+            Ok(Value::Str(parts.join(sep)))
+        }
+        _ => Err(format!("join: expected (string, list), got ({}, {})", args[0], args[1])),
+    }
+}
+
+fn builtin_trim(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("trim requires exactly 1 argument".to_string());
+    }
+    match &args[0] {
+        Value::Str(s) => Ok(Value::Str(s.trim().to_string())),
+        _ => Err(format!("trim: expected string, got {}", args[0])),
+    }
+}
+
+fn builtin_contains(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("has requires exactly 2 arguments".to_string());
+    }
+    match (&args[0], &args[1]) {
+        (Value::Str(haystack), Value::Str(needle)) => Ok(Value::Bool(haystack.contains(needle.as_str()))),
+        (Value::List(list), val) => Ok(Value::Bool(list.contains(val))),
+        _ => Err(format!("has: expected (string, string) or (list, value), got ({}, {})", args[0], args[1])),
+    }
+}
+
+fn builtin_replace(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err("replace requires exactly 3 arguments (string, from, to)".to_string());
+    }
+    match (&args[0], &args[1], &args[2]) {
+        (Value::Str(s), Value::Str(from), Value::Str(to)) => {
+            Ok(Value::Str(s.replace(from.as_str(), to)))
+        }
+        _ => Err(format!(
+            "replace: expected (string, string, string), got ({}, {}, {})",
+            args[0], args[1], args[2]
+        )),
+    }
+}
+
+fn builtin_starts_with(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("starts-with requires exactly 2 arguments".to_string());
+    }
+    match (&args[0], &args[1]) {
+        (Value::Str(s), Value::Str(prefix)) => Ok(Value::Bool(s.starts_with(prefix.as_str()))),
+        _ => Err(format!("starts-with: expected (string, string), got ({}, {})", args[0], args[1])),
+    }
+}
+
+fn builtin_ends_with(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("ends-with requires exactly 2 arguments".to_string());
+    }
+    match (&args[0], &args[1]) {
+        (Value::Str(s), Value::Str(suffix)) => Ok(Value::Bool(s.ends_with(suffix.as_str()))),
+        _ => Err(format!("ends-with: expected (string, string), got ({}, {})", args[0], args[1])),
+    }
+}
+
+fn builtin_upper_case(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("upcase requires exactly 1 argument".to_string());
+    }
+    match &args[0] {
+        Value::Str(s) => Ok(Value::Str(s.to_uppercase())),
+        _ => Err(format!("upcase: expected string, got {}", args[0])),
+    }
+}
+
+fn builtin_lower_case(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("downcase requires exactly 1 argument".to_string());
+    }
+    match &args[0] {
+        Value::Str(s) => Ok(Value::Str(s.to_lowercase())),
+        _ => Err(format!("downcase: expected string, got {}", args[0])),
+    }
+}
+
+// -- Type builtins --
+
+fn builtin_type_of(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("type-of requires exactly 1 argument".to_string());
+    }
+    let t = match &args[0] {
+        Value::Int(_) => "int",
+        Value::Float(_) => "float",
+        Value::Str(_) => "string",
+        Value::Bool(_) => "bool",
+        Value::Nil => "nil",
+        Value::List(_) => "list",
+        Value::Lambda { .. } => "lambda",
+        Value::Builtin { .. } => "builtin",
+    };
+    Ok(Value::Str(t.to_string()))
+}
+
+fn builtin_is_int(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("int? requires exactly 1 argument".to_string());
+    }
+    Ok(Value::Bool(matches!(args[0], Value::Int(_))))
+}
+
+fn builtin_is_float(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("float? requires exactly 1 argument".to_string());
+    }
+    Ok(Value::Bool(matches!(args[0], Value::Float(_))))
+}
+
+fn builtin_is_string(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("string? requires exactly 1 argument".to_string());
+    }
+    Ok(Value::Bool(matches!(args[0], Value::Str(_))))
+}
+
+fn builtin_is_bool(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("bool? requires exactly 1 argument".to_string());
+    }
+    Ok(Value::Bool(matches!(args[0], Value::Bool(_))))
+}
+
+fn builtin_is_list(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("list? requires exactly 1 argument".to_string());
+    }
+    Ok(Value::Bool(matches!(args[0], Value::List(_))))
+}
+
+fn builtin_is_nil(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("nil? requires exactly 1 argument".to_string());
+    }
+    Ok(Value::Bool(matches!(args[0], Value::Nil)))
+}
+
+fn builtin_is_number(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("number? requires exactly 1 argument".to_string());
+    }
+    Ok(Value::Bool(matches!(args[0], Value::Int(_) | Value::Float(_))))
+}
+
+// -- Conversion builtins --
+
+fn builtin_to_int(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("->int requires exactly 1 argument".to_string());
+    }
+    match &args[0] {
+        Value::Int(n) => Ok(Value::Int(*n)),
+        Value::Float(f) => Ok(Value::Int(*f as i64)),
+        Value::Str(s) => s
+            .parse::<i64>()
+            .map(Value::Int)
+            .map_err(|_| format!("->int: cannot convert '{}' to int", s)),
+        Value::Bool(b) => Ok(Value::Int(if *b { 1 } else { 0 })),
+        other => Err(format!("->int: cannot convert {} to int", other)),
+    }
+}
+
+fn builtin_to_float(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("->float requires exactly 1 argument".to_string());
+    }
+    match &args[0] {
+        Value::Int(n) => Ok(Value::Float(*n as f64)),
+        Value::Float(f) => Ok(Value::Float(*f)),
+        Value::Str(s) => s
+            .parse::<f64>()
+            .map(Value::Float)
+            .map_err(|_| format!("->float: cannot convert '{}' to float", s)),
+        other => Err(format!("->float: cannot convert {} to float", other)),
+    }
+}
+
+fn builtin_to_str(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("->str requires exactly 1 argument".to_string());
+    }
+    Ok(Value::Str(format!("{}", args[0])))
+}
+
+// -- I/O builtins --
+
+fn builtin_println(args: &[Value]) -> Result<Value, String> {
+    let parts: Vec<String> = args.iter().map(|v| format!("{}", v)).collect();
+    println!("{}", parts.join(" "));
+    Ok(Value::Nil)
+}
+
+fn builtin_print(args: &[Value]) -> Result<Value, String> {
+    let parts: Vec<String> = args.iter().map(|v| format!("{}", v)).collect();
+    print!("{}", parts.join(" "));
+    Ok(Value::Nil)
+}
+
+fn builtin_read_line(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err("readline takes no arguments".to_string());
+    }
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .map_err(|e| e.to_string())?;
+    Ok(Value::Str(input.trim_end_matches('\n').to_string()))
+}
+
+fn builtin_read_file(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("readfile requires exactly 1 argument".to_string());
+    }
+    match &args[0] {
+        Value::Str(path) => {
+            let content = std::fs::read_to_string(path)
+                .map_err(|e| format!("readfile: {}", e))?;
+            Ok(Value::Str(content))
+        }
+        _ => Err(format!("readfile: expected string, got {}", args[0])),
+    }
+}
+
+fn builtin_write_file(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("writefile requires exactly 2 arguments (path, content)".to_string());
+    }
+    match (&args[0], &args[1]) {
+        (Value::Str(path), Value::Str(content)) => {
+            std::fs::write(path, content).map_err(|e| format!("writefile: {}", e))?;
+            Ok(Value::Nil)
+        }
+        _ => Err(format!(
+            "writefile: expected (string, string), got ({}, {})",
+            args[0], args[1]
+        )),
+    }
+}
+
+// -- Debug/Test builtins --
+
+fn builtin_dbg(args: &[Value]) -> Result<Value, String> {
+    for arg in args {
+        eprintln!("[dbg] {:?}", arg);
+    }
+    if args.len() == 1 {
+        Ok(args[0].clone())
+    } else {
+        Ok(Value::Nil)
+    }
+}
+
+fn builtin_assert(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("assert requires exactly 1 argument".to_string());
+    }
+    if is_truthy(&args[0]) {
+        Ok(Value::Nil)
+    } else {
+        Err(format!("[assert] assertion failed: {}", args[0]))
+    }
+}
+
+fn builtin_assert_eq(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("assert-eq requires exactly 2 arguments".to_string());
+    }
+    if args[0] == args[1] {
+        Ok(Value::Nil)
+    } else {
+        Err(format!(
+            "[assert] expected: {}, got: {}",
+            args[0], args[1]
+        ))
+    }
+}
+
+fn builtin_assert_ne(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("assert-ne requires exactly 2 arguments".to_string());
+    }
+    if args[0] != args[1] {
+        Ok(Value::Nil)
+    } else {
+        Err(format!(
+            "[assert] expected values to differ, both are: {}",
+            args[0]
+        ))
+    }
+}
+
+fn builtin_assert_true(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("assert-true requires exactly 1 argument".to_string());
+    }
+    if is_truthy(&args[0]) {
+        Ok(Value::Nil)
+    } else {
+        Err(format!(
+            "[assert] expected truthy, got: {}",
+            args[0]
+        ))
+    }
+}
+
+fn builtin_assert_false(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("assert-false requires exactly 1 argument".to_string());
+    }
+    if !is_truthy(&args[0]) {
+        Ok(Value::Nil)
+    } else {
+        Err(format!(
+            "[assert] expected falsy, got: {}",
+            args[0]
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Interpreter struct -- public API
+// ---------------------------------------------------------------------------
+
 pub struct Interpreter {
-    pub(crate) env: Env,
+    pub env: Env,
+}
+
+impl Default for Interpreter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Interpreter {
     pub fn new() -> Self {
         let mut env = Env::new();
-
-        // Register built-in functions
-        let builtins = vec![
-            "println", "print", "to_str", "to_int", "to_float", "len", "push",
-            "map", "filter", "fold", "range", "split", "join", "trim",
-            "contains", "sort", "sort_by", "rev", "enumerate", "zip",
-            "flat_map", "any", "all", "find", "unique", "chunk", "take",
-            "skip", "min", "max", "abs", "dbg", "assert", "assert_eq",
-            "assert_ne", "assert_true", "assert_false", "type_of",
-            "read_file", "write_file", "read_line", "parse_json",
-            "group_by", "flatten", "reduce", "replace", "starts_with",
-            "ends_with", "to_upper", "to_lower",
-        ];
-        for name in builtins {
-            env.set(name.to_string(), Value::BuiltinFn(name.to_string()));
-        }
-
+        register_builtins(&mut env);
         Interpreter { env }
     }
 
-    /// Load all function declarations from a program into the environment
-    /// without executing main() or top-level expressions.
-    pub fn load_declarations(&mut self, program: &Program) {
-        for item in &program.items {
-            if let Item::FnDecl(f) = item {
-                let val = Value::Fn {
-                    name: f.name.clone(),
-                    params: f.params.clone(),
-                    body: f.body.clone(),
-                    closure: self.env.clone(),
-                };
-                self.env.set(f.name.clone(), val);
-            }
+    /// Lex, parse, evaluate all top-level forms. Call `main` if defined.
+    pub fn run(&mut self, source: &str) -> Result<(), String> {
+        let mut lexer = crate::lexer::Lexer::new(source);
+        let tokens = lexer.tokenize()?;
+        let mut parser = crate::parser::Parser::new(tokens);
+        let exprs = parser.parse()?;
+
+        for expr in &exprs {
+            evaluate(expr, &mut self.env)?;
         }
-    }
 
-    pub fn run(&mut self, program: &Program) -> Result<(), String> {
-        // First pass: collect all function declarations
-        self.load_declarations(program);
-
-        // Look for main() and call it
+        // Call main if defined
         if let Some(main_fn) = self.env.get("main") {
-            self.call_function(&main_fn, &[])?;
-        } else {
-            // Execute top-level expressions and statements
-            for item in &program.items {
-                match item {
-                    Item::ExprStmt(expr) => {
-                        self.eval_expr(expr)?;
-                    }
-                    Item::Stmt(stmt) => {
-                        self.eval_stmt(stmt)?;
-                    }
-                    Item::FnDecl(_) => {}
-                }
-            }
+            call_value(&main_fn, &[])?;
         }
 
         Ok(())
     }
 
-    /// Evaluate a single top-level item and return the resulting value.
-    /// Used by the REPL to evaluate each parsed item independently.
-    pub fn eval_item(&mut self, item: &Item) -> Result<Value, String> {
-        match item {
-            Item::FnDecl(f) => {
-                let val = Value::Fn {
-                    name: f.name.clone(),
-                    params: f.params.clone(),
-                    body: f.body.clone(),
-                    closure: self.env.clone(),
-                };
-                self.env.set(f.name.clone(), val);
-                Ok(Value::Unit)
-            }
-            Item::ExprStmt(expr) => self.eval_expr(expr),
-            Item::Stmt(stmt) => self.eval_stmt(stmt),
+    /// Lex, parse, evaluate all forms, return results.
+    pub fn run_source(&mut self, source: &str) -> Result<Vec<Value>, String> {
+        let mut lexer = crate::lexer::Lexer::new(source);
+        let tokens = lexer.tokenize()?;
+        let mut parser = crate::parser::Parser::new(tokens);
+        let exprs = parser.parse()?;
+
+        let mut results = Vec::new();
+        for expr in &exprs {
+            results.push(evaluate(expr, &mut self.env)?);
+        }
+        Ok(results)
+    }
+
+    /// Lex, parse, evaluate, return last result (used by REPL and tests).
+    pub fn eval_source(&mut self, source: &str) -> Result<Value, String> {
+        let mut lexer = crate::lexer::Lexer::new(source);
+        let tokens = lexer.tokenize()?;
+        let mut parser = crate::parser::Parser::new(tokens);
+        let exprs = parser.parse()?;
+
+        let mut result = Value::Nil;
+        for expr in &exprs {
+            result = evaluate(expr, &mut self.env)?;
+        }
+        Ok(result)
+    }
+
+    /// Lex, parse, evaluate all forms but do not call main (used by test runner).
+    pub fn load_source(&mut self, source: &str) {
+        let mut lexer = crate::lexer::Lexer::new(source);
+        let tokens = match lexer.tokenize() {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        let mut parser = crate::parser::Parser::new(tokens);
+        let exprs = match parser.parse() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for expr in &exprs {
+            let _ = evaluate(expr, &mut self.env);
         }
     }
 
-    fn eval_block(&mut self, block: &Block) -> Result<Value, String> {
-        let saved_env = self.env.clone();
-        self.env = Env::child(&saved_env);
-
-        let result = self.eval_block_inner(block);
-
-        self.env = saved_env;
-        result
-    }
-
-    fn eval_block_inner(&mut self, block: &Block) -> Result<Value, String> {
-        for stmt in &block.stmts {
-            match self.eval_stmt(stmt) {
-                Ok(_) => {}
-                Err(e) => return Err(e),
-            }
-        }
-
-        if let Some(expr) = &block.expr {
-            self.eval_expr(expr)
-        } else {
-            Ok(Value::Unit)
-        }
-    }
-
-    fn eval_block_with_signals(&mut self, block: &Block) -> Result<Value, Result<Signal, String>> {
-        for stmt in &block.stmts {
-            match self.eval_stmt_with_signals(stmt) {
-                Ok(_) => {}
-                Err(Ok(signal)) => return Err(Ok(signal)),
-                Err(Err(e)) => return Err(Err(e)),
-            }
-        }
-
-        if let Some(expr) = &block.expr {
-            self.eval_expr(expr).map_err(Err)
-        } else {
-            Ok(Value::Unit)
-        }
-    }
-
-    fn eval_stmt(&mut self, stmt: &Stmt) -> Result<Value, String> {
-        match self.eval_stmt_with_signals(stmt) {
-            Ok(v) => Ok(v),
-            Err(Ok(Signal::Return(v))) => Err(format!("__return__{}", self.value_to_debug(&v))),
-            Err(Ok(Signal::Break)) => Err("__break__".to_string()),
-            Err(Err(e)) => Err(e),
-        }
-    }
-
-    fn eval_stmt_with_signals(&mut self, stmt: &Stmt) -> Result<Value, Result<Signal, String>> {
-        match stmt {
-            Stmt::Let(let_stmt) => {
-                let value = self.eval_expr(&let_stmt.value).map_err(Err)?;
-                self.bind_pattern(&let_stmt.pattern, &value).map_err(Err)?;
-                Ok(Value::Unit)
-            }
-            Stmt::Expr(expr) => self.eval_expr(expr).map_err(Err),
-            Stmt::For(for_stmt) => {
-                let iterable = self.eval_expr(&for_stmt.iterable).map_err(Err)?;
-                let items = self.value_to_iterable(&iterable).map_err(Err)?;
-
-                let saved_env = self.env.clone();
-
-                for item in items {
-                    self.env = Env::child(&saved_env);
-                    self.bind_pattern(&for_stmt.binding, &item).map_err(Err)?;
-                    match self.eval_block_with_signals(&for_stmt.body) {
-                        Ok(_) => {}
-                        Err(Ok(Signal::Break)) => {
-                            self.env = saved_env;
-                            return Ok(Value::Unit);
-                        }
-                        Err(Ok(Signal::Return(v))) => {
-                            self.env = saved_env;
-                            return Err(Ok(Signal::Return(v)));
-                        }
-                        Err(Err(e)) => {
-                            self.env = saved_env;
-                            return Err(Err(e));
-                        }
-                    }
-                }
-                self.env = saved_env;
-                Ok(Value::Unit)
-            }
-            Stmt::While(while_stmt) => {
-                loop {
-                    let cond = self.eval_expr(&while_stmt.condition).map_err(Err)?;
-                    if !cond.is_truthy() {
-                        break;
-                    }
-                    let saved_env = self.env.clone();
-                    self.env = Env::child(&saved_env);
-                    match self.eval_block_with_signals(&while_stmt.body) {
-                        Ok(_) => {}
-                        Err(Ok(Signal::Break)) => {
-                            self.env = saved_env;
-                            break;
-                        }
-                        Err(Ok(Signal::Return(v))) => {
-                            self.env = saved_env;
-                            return Err(Ok(Signal::Return(v)));
-                        }
-                        Err(Err(e)) => {
-                            self.env = saved_env;
-                            return Err(Err(e));
-                        }
-                    }
-                    self.env = saved_env;
-                }
-                Ok(Value::Unit)
-            }
-            Stmt::Return(maybe_expr) => {
-                let val = if let Some(expr) = maybe_expr {
-                    self.eval_expr(expr).map_err(Err)?
-                } else {
-                    Value::Unit
-                };
-                Err(Ok(Signal::Return(val)))
-            }
-            Stmt::Break => Err(Ok(Signal::Break)),
-        }
-    }
-
-    fn eval_expr(&mut self, expr: &Expr) -> Result<Value, String> {
-        match expr {
-            Expr::Literal(lit) => Ok(self.literal_to_value(lit)),
-            Expr::Ident(name, _span) => {
-                self.env
-                    .get(name)
-                    .ok_or_else(|| format!("Undefined variable: {}", name))
-            }
-            Expr::Binary(left, op, right, _span) => {
-                let l = self.eval_expr(left)?;
-                let r = self.eval_expr(right)?;
-                self.eval_binop(op, &l, &r)
-            }
-            Expr::Unary(op, operand, _span) => {
-                let val = self.eval_expr(operand)?;
-                self.eval_unop(op, &val)
-            }
-            Expr::Call(callee, args, _span) => {
-                let func = self.eval_expr(callee)?;
-                let mut eval_args = Vec::new();
-                for arg in args {
-                    eval_args.push(self.eval_expr(arg)?);
-                }
-                self.call_function(&func, &eval_args)
-            }
-            Expr::Pipeline(left, right, _span) => {
-                let left_val = self.eval_expr(left)?;
-                // Desugar: x |> f(a, b) => f(x, a, b)
-                //          x |> f       => f(x)
-                match right.as_ref() {
-                    Expr::Call(callee, args, _span) => {
-                        let func = self.eval_expr(callee)?;
-                        let mut all_args = vec![left_val];
-                        for arg in args {
-                            all_args.push(self.eval_expr(arg)?);
-                        }
-                        self.call_function(&func, &all_args)
-                    }
-                    Expr::Ident(_, _) => {
-                        let func = self.eval_expr(right)?;
-                        self.call_function(&func, &[left_val])
-                    }
-                    _ => {
-                        let func = self.eval_expr(right)?;
-                        self.call_function(&func, &[left_val])
-                    }
-                }
-            }
-            Expr::Index(obj, idx, _span) => {
-                let obj_val = self.eval_expr(obj)?;
-                let idx_val = self.eval_expr(idx)?;
-                match (&obj_val, &idx_val) {
-                    (Value::List(list), Value::Int(i)) => {
-                        let i = *i as usize;
-                        list.get(i)
-                            .cloned()
-                            .ok_or_else(|| format!("Index {} out of bounds (len {})", i, list.len()))
-                    }
-                    (Value::Str(s), Value::Int(i)) => {
-                        let i = *i as usize;
-                        s.chars()
-                            .nth(i)
-                            .map(|c| Value::Str(c.to_string()))
-                            .ok_or_else(|| format!("Index {} out of bounds", i))
-                    }
-                    _ => Err(format!("Cannot index {:?} with {:?}", obj_val, idx_val)),
-                }
-            }
-            Expr::Field(obj, field, _span) => {
-                let obj_val = self.eval_expr(obj)?;
-                match &obj_val {
-                    Value::Tuple(vals) => {
-                        // Field access on tuple: .0, .1, etc.
-                        let idx: usize = field
-                            .parse()
-                            .map_err(|_| format!("Invalid tuple field: {}", field))?;
-                        vals.get(idx)
-                            .cloned()
-                            .ok_or_else(|| format!("Tuple index {} out of bounds", idx))
-                    }
-                    _ => Err(format!("Cannot access field {} on {:?}", field, obj_val)),
-                }
-            }
-            Expr::Range(start, end, inclusive, _span) => {
-                let s = self.eval_expr(start)?;
-                let e = self.eval_expr(end)?;
-                match (&s, &e) {
-                    (Value::Int(a), Value::Int(b)) => {
-                        let end = if *inclusive { *b + 1 } else { *b };
-                        let items: Vec<Value> = (*a..end).map(Value::Int).collect();
-                        Ok(Value::List(items))
-                    }
-                    _ => Err(format!("Range requires integer bounds, got {:?}..{:?}", s, e)),
-                }
-            }
-            Expr::Tuple(exprs, _span) => {
-                let mut vals = Vec::new();
-                for e in exprs {
-                    vals.push(self.eval_expr(e)?);
-                }
-                Ok(Value::Tuple(vals))
-            }
-            Expr::List(exprs, _span) => {
-                let mut vals = Vec::new();
-                for e in exprs {
-                    vals.push(self.eval_expr(e)?);
-                }
-                Ok(Value::List(vals))
-            }
-            Expr::Lambda(params, body, _span) => Ok(Value::Lambda {
-                params: params.clone(),
-                body: body.clone(),
-                closure: self.env.clone(),
-            }),
-            Expr::StringInterp(parts, _span) => {
-                let mut result = String::new();
-                for part in parts {
-                    match part {
-                        StringPart::Lit(s) => result.push_str(s),
-                        StringPart::Expr(e) => {
-                            let val = self.eval_expr(e)?;
-                            result.push_str(&format!("{}", val));
-                        }
-                    }
-                }
-                Ok(Value::Str(result))
-            }
-            Expr::If(cond, then_block, else_branch, _span) => {
-                let cond_val = self.eval_expr(cond)?;
-                if cond_val.is_truthy() {
-                    self.eval_block(then_block)
-                } else if let Some(else_expr) = else_branch {
-                    self.eval_expr(else_expr)
-                } else {
-                    Ok(Value::Unit)
-                }
-            }
-            Expr::Match(scrutinee, arms, _span) => {
-                let val = self.eval_expr(scrutinee)?;
-                for arm in arms {
-                    let saved_env = self.env.clone();
-                    if self.match_pattern(&arm.pattern, &val)? {
-                        let result = self.eval_expr(&arm.body);
-                        if result.is_err() {
-                            self.env = saved_env;
-                        }
-                        return result;
-                    }
-                    self.env = saved_env;
-                }
-                Err(format!("No matching arm in match expression for value: {}", val))
-            }
-            Expr::Block(block, _span) => self.eval_block(block),
-            Expr::Assign(target, value, _span) => {
-                let val = self.eval_expr(value)?;
-                match target.as_ref() {
-                    Expr::Ident(name, _) => {
-                        if !self.env.update(name, val.clone()) {
-                            return Err(format!("Cannot assign to undefined variable: {}", name));
-                        }
-                        Ok(val)
-                    }
-                    _ => Err("Can only assign to identifiers".to_string()),
-                }
-            }
-            Expr::CompoundAssign(target, op, value, _span) => {
-                let current = self.eval_expr(target)?;
-                let rhs = self.eval_expr(value)?;
-                let result = self.eval_binop(op, &current, &rhs)?;
-                match target.as_ref() {
-                    Expr::Ident(name, _) => {
-                        if !self.env.update(name, result.clone()) {
-                            return Err(format!("Cannot assign to undefined variable: {}", name));
-                        }
-                        Ok(result)
-                    }
-                    _ => Err("Can only assign to identifiers".to_string()),
-                }
-            }
-        }
-    }
-
-    fn literal_to_value(&self, lit: &Literal) -> Value {
-        match lit {
-            Literal::Int(n) => Value::Int(*n),
-            Literal::Float(f) => Value::Float(*f),
-            Literal::Str(s) => Value::Str(s.clone()),
-            Literal::Bool(b) => Value::Bool(*b),
-        }
-    }
-
-    fn eval_binop(&self, op: &BinOp, left: &Value, right: &Value) -> Result<Value, String> {
-        match (op, left, right) {
-            // Integer arithmetic
-            (BinOp::Add, Value::Int(a), Value::Int(b)) => Ok(Value::Int(a + b)),
-            (BinOp::Sub, Value::Int(a), Value::Int(b)) => Ok(Value::Int(a - b)),
-            (BinOp::Mul, Value::Int(a), Value::Int(b)) => Ok(Value::Int(a * b)),
-            (BinOp::Div, Value::Int(a), Value::Int(b)) => {
-                if *b == 0 {
-                    Err("Division by zero".to_string())
-                } else {
-                    Ok(Value::Int(a / b))
-                }
-            }
-            (BinOp::Mod, Value::Int(a), Value::Int(b)) => {
-                if *b == 0 {
-                    Err("Modulo by zero".to_string())
-                } else {
-                    Ok(Value::Int(a % b))
-                }
-            }
-
-            // Float arithmetic
-            (BinOp::Add, Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
-            (BinOp::Sub, Value::Float(a), Value::Float(b)) => Ok(Value::Float(a - b)),
-            (BinOp::Mul, Value::Float(a), Value::Float(b)) => Ok(Value::Float(a * b)),
-            (BinOp::Div, Value::Float(a), Value::Float(b)) => Ok(Value::Float(a / b)),
-            (BinOp::Mod, Value::Float(a), Value::Float(b)) => Ok(Value::Float(a % b)),
-
-            // Mixed int/float
-            (BinOp::Add, Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 + b)),
-            (BinOp::Add, Value::Float(a), Value::Int(b)) => Ok(Value::Float(a + *b as f64)),
-            (BinOp::Sub, Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 - b)),
-            (BinOp::Sub, Value::Float(a), Value::Int(b)) => Ok(Value::Float(a - *b as f64)),
-            (BinOp::Mul, Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 * b)),
-            (BinOp::Mul, Value::Float(a), Value::Int(b)) => Ok(Value::Float(a * *b as f64)),
-            (BinOp::Div, Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 / b)),
-            (BinOp::Div, Value::Float(a), Value::Int(b)) => Ok(Value::Float(a / *b as f64)),
-
-            // String concatenation with +
-            (BinOp::Add, Value::Str(a), Value::Str(b)) => {
-                Ok(Value::Str(format!("{}{}", a, b)))
-            }
-
-            // Comparisons - integers
-            (BinOp::Eq, Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a == b)),
-            (BinOp::Ne, Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a != b)),
-            (BinOp::Lt, Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a < b)),
-            (BinOp::Gt, Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a > b)),
-            (BinOp::Le, Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a <= b)),
-            (BinOp::Ge, Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a >= b)),
-
-            // Comparisons - strings
-            (BinOp::Eq, Value::Str(a), Value::Str(b)) => Ok(Value::Bool(a == b)),
-            (BinOp::Ne, Value::Str(a), Value::Str(b)) => Ok(Value::Bool(a != b)),
-            (BinOp::Lt, Value::Str(a), Value::Str(b)) => Ok(Value::Bool(a < b)),
-            (BinOp::Gt, Value::Str(a), Value::Str(b)) => Ok(Value::Bool(a > b)),
-
-            // Comparisons - booleans
-            (BinOp::Eq, Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(a == b)),
-            (BinOp::Ne, Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(a != b)),
-
-            // Comparisons - floats
-            (BinOp::Eq, Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a == b)),
-            (BinOp::Ne, Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a != b)),
-            (BinOp::Lt, Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a < b)),
-            (BinOp::Gt, Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a > b)),
-            (BinOp::Le, Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a <= b)),
-            (BinOp::Ge, Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a >= b)),
-
-            // Logical operators
-            (BinOp::And, Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(*a && *b)),
-            (BinOp::Or, Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(*a || *b)),
-
-            // Concat (++)
-            (BinOp::Concat, Value::List(a), Value::List(b)) => {
-                let mut result = a.clone();
-                result.extend(b.clone());
-                Ok(Value::List(result))
-            }
-            (BinOp::Concat, Value::Str(a), Value::Str(b)) => {
-                Ok(Value::Str(format!("{}{}", a, b)))
-            }
-
-            _ => Err(format!(
-                "Unsupported binary operation {:?} on {} and {}",
-                op, left, right
-            )),
-        }
-    }
-
-    fn eval_unop(&self, op: &UnaryOp, val: &Value) -> Result<Value, String> {
-        match (op, val) {
-            (UnaryOp::Neg, Value::Int(n)) => Ok(Value::Int(-n)),
-            (UnaryOp::Neg, Value::Float(f)) => Ok(Value::Float(-f)),
-            (UnaryOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
-            _ => Err(format!("Unsupported unary operation {:?} on {}", op, val)),
-        }
-    }
-
-    pub(crate) fn call_function(&mut self, func: &Value, args: &[Value]) -> Result<Value, String> {
-        match func {
-            Value::BuiltinFn(name) => self.call_builtin(name, args),
-            Value::Fn {
-                params,
-                body,
-                closure,
-                ..
-            } => {
-                let saved_env = self.env.clone();
-                self.env = Env::child(closure);
-
-                for (i, param) in params.iter().enumerate() {
-                    let val = args.get(i).cloned().unwrap_or(Value::Unit);
-                    self.env.set(param.name.clone(), val);
-                }
-
-                // Also make sure all top-level functions are available
-                for (name, val) in saved_env.bindings.iter() {
-                    if matches!(val, Value::Fn { .. } | Value::BuiltinFn(_)) {
-                        if self.env.get(name).is_none() {
-                            self.env.set(name.clone(), val.clone());
-                        }
-                    }
-                }
-
-                let result = match self.eval_block_with_signals(body) {
-                    Ok(v) => Ok(v),
-                    Err(Ok(Signal::Return(v))) => Ok(v),
-                    Err(Ok(Signal::Break)) => Err("break outside of loop".to_string()),
-                    Err(Err(e)) => Err(e),
-                };
-
-                self.env = saved_env;
-                result
-            }
-            Value::Lambda {
-                params,
-                body,
-                closure,
-            } => {
-                let saved_env = self.env.clone();
-                self.env = Env::child(closure);
-
-                for (i, param) in params.iter().enumerate() {
-                    let val = args.get(i).cloned().unwrap_or(Value::Unit);
-                    self.env.set(param.name.clone(), val);
-                }
-
-                // Make sure builtins and top-level functions are accessible
-                for (name, val) in saved_env.bindings.iter() {
-                    if matches!(val, Value::Fn { .. } | Value::BuiltinFn(_)) {
-                        if self.env.get(name).is_none() {
-                            self.env.set(name.clone(), val.clone());
-                        }
-                    }
-                }
-
-                let result = self.eval_expr(body);
-                self.env = saved_env;
-                result
-            }
-            _ => Err(format!("Cannot call non-function value: {}", func)),
-        }
-    }
-
-    fn call_builtin(&mut self, name: &str, args: &[Value]) -> Result<Value, String> {
-        match name {
-            "println" => {
-                if let Some(val) = args.first() {
-                    println!("{}", val);
-                } else {
-                    println!();
-                }
-                Ok(Value::Unit)
-            }
-            "print" => {
-                if let Some(val) = args.first() {
-                    print!("{}", val);
-                }
-                Ok(Value::Unit)
-            }
-            "to_str" => {
-                let val = args.first().ok_or("to_str requires 1 argument")?;
-                Ok(Value::Str(format!("{}", val)))
-            }
-            "to_int" => {
-                let val = args.first().ok_or("to_int requires 1 argument")?;
-                match val {
-                    Value::Str(s) => {
-                        let n: i64 = s
-                            .trim()
-                            .parse()
-                            .map_err(|e| format!("Cannot parse '{}' as int: {}", s, e))?;
-                        Ok(Value::Int(n))
-                    }
-                    Value::Float(f) => Ok(Value::Int(*f as i64)),
-                    Value::Int(n) => Ok(Value::Int(*n)),
-                    _ => Err(format!("Cannot convert {} to int", val)),
-                }
-            }
-            "to_float" => {
-                let val = args.first().ok_or("to_float requires 1 argument")?;
-                match val {
-                    Value::Str(s) => {
-                        let f: f64 = s
-                            .trim()
-                            .parse()
-                            .map_err(|e| format!("Cannot parse '{}' as float: {}", s, e))?;
-                        Ok(Value::Float(f))
-                    }
-                    Value::Int(n) => Ok(Value::Float(*n as f64)),
-                    Value::Float(f) => Ok(Value::Float(*f)),
-                    _ => Err(format!("Cannot convert {} to float", val)),
-                }
-            }
-            "len" => {
-                let val = args.first().ok_or("len requires 1 argument")?;
-                match val {
-                    Value::List(l) => Ok(Value::Int(l.len() as i64)),
-                    Value::Str(s) => Ok(Value::Int(s.len() as i64)),
-                    _ => Err(format!("Cannot get length of {}", val)),
-                }
-            }
-            "push" => {
-                let list = args.first().ok_or("push requires 2 arguments")?;
-                let item = args.get(1).ok_or("push requires 2 arguments")?;
-                match list {
-                    Value::List(l) => {
-                        let mut new_list = l.clone();
-                        new_list.push(item.clone());
-                        Ok(Value::List(new_list))
-                    }
-                    _ => Err(format!("push requires a list, got {}", list)),
-                }
-            }
-            "map" => {
-                let list = args.first().ok_or("map requires 2 arguments")?;
-                let func = args.get(1).ok_or("map requires 2 arguments")?;
-                match list {
-                    Value::List(items) => {
-                        let mut result = Vec::new();
-                        for item in items {
-                            result.push(self.call_function(func, &[item.clone()])?);
-                        }
-                        Ok(Value::List(result))
-                    }
-                    _ => Err(format!("map requires a list, got {}", list)),
-                }
-            }
-            "filter" => {
-                let list = args.first().ok_or("filter requires 2 arguments")?;
-                let func = args.get(1).ok_or("filter requires 2 arguments")?;
-                match list {
-                    Value::List(items) => {
-                        let mut result = Vec::new();
-                        for item in items {
-                            let keep = self.call_function(func, &[item.clone()])?;
-                            if keep.is_truthy() {
-                                result.push(item.clone());
-                            }
-                        }
-                        Ok(Value::List(result))
-                    }
-                    _ => Err(format!("filter requires a list, got {}", list)),
-                }
-            }
-            "fold" => {
-                let list = args.first().ok_or("fold requires 3 arguments")?;
-                let init = args.get(1).ok_or("fold requires 3 arguments")?;
-                let func = args.get(2).ok_or("fold requires 3 arguments")?;
-                match list {
-                    Value::List(items) => {
-                        let mut acc = init.clone();
-                        for item in items {
-                            acc = self.call_function(func, &[acc, item.clone()])?;
-                        }
-                        Ok(acc)
-                    }
-                    _ => Err(format!("fold requires a list, got {}", list)),
-                }
-            }
-            "range" => {
-                let start = args.first().ok_or("range requires 2 arguments")?;
-                let end = args.get(1).ok_or("range requires 2 arguments")?;
-                match (start, end) {
-                    (Value::Int(a), Value::Int(b)) => {
-                        let items: Vec<Value> = (*a..*b).map(Value::Int).collect();
-                        Ok(Value::List(items))
-                    }
-                    _ => Err("range requires integer arguments".to_string()),
-                }
-            }
-            "split" => {
-                let s = args.first().ok_or("split requires 2 arguments")?;
-                let delim = args.get(1).ok_or("split requires 2 arguments")?;
-                match (s, delim) {
-                    (Value::Str(s), Value::Str(d)) => {
-                        let parts: Vec<Value> = s.split(d.as_str()).map(|p| Value::Str(p.to_string())).collect();
-                        Ok(Value::List(parts))
-                    }
-                    _ => Err("split requires string arguments".to_string()),
-                }
-            }
-            "join" => {
-                let list = args.first().ok_or("join requires 2 arguments")?;
-                let sep = args.get(1).ok_or("join requires 2 arguments")?;
-                match (list, sep) {
-                    (Value::List(items), Value::Str(s)) => {
-                        let parts: Vec<String> = items.iter().map(|v| format!("{}", v)).collect();
-                        Ok(Value::Str(parts.join(s)))
-                    }
-                    _ => Err("join requires a list and string separator".to_string()),
-                }
-            }
-            "trim" => {
-                let s = args.first().ok_or("trim requires 1 argument")?;
-                match s {
-                    Value::Str(s) => Ok(Value::Str(s.trim().to_string())),
-                    _ => Err("trim requires a string".to_string()),
-                }
-            }
-            "contains" => {
-                let container = args.first().ok_or("contains requires 2 arguments")?;
-                let item = args.get(1).ok_or("contains requires 2 arguments")?;
-                match container {
-                    Value::Str(s) => match item {
-                        Value::Str(sub) => Ok(Value::Bool(s.contains(sub.as_str()))),
-                        _ => Err("contains on string requires string argument".to_string()),
-                    },
-                    Value::List(items) => {
-                        let found = items.iter().any(|v| self.values_equal(v, item));
-                        Ok(Value::Bool(found))
-                    }
-                    _ => Err("contains requires a string or list".to_string()),
-                }
-            }
-            "sort" => {
-                let list = args.first().ok_or("sort requires 1 argument")?;
-                match list {
-                    Value::List(items) => {
-                        let mut sorted = items.clone();
-                        sorted.sort_by(|a, b| self.compare_values(a, b));
-                        Ok(Value::List(sorted))
-                    }
-                    _ => Err("sort requires a list".to_string()),
-                }
-            }
-            "sort_by" => {
-                let list = args.first().ok_or("sort_by requires 2 arguments")?;
-                let func = args.get(1).ok_or("sort_by requires 2 arguments")?;
-                match list {
-                    Value::List(items) => {
-                        let mut keyed: Vec<(Value, Value)> = Vec::new();
-                        for item in items {
-                            let key = self.call_function(func, &[item.clone()])?;
-                            keyed.push((item.clone(), key));
-                        }
-                        keyed.sort_by(|a, b| self.compare_values(&a.1, &b.1));
-                        let sorted: Vec<Value> = keyed.into_iter().map(|(v, _)| v).collect();
-                        Ok(Value::List(sorted))
-                    }
-                    _ => Err("sort_by requires a list".to_string()),
-                }
-            }
-            "rev" => {
-                let list = args.first().ok_or("rev requires 1 argument")?;
-                match list {
-                    Value::List(items) => {
-                        let mut reversed = items.clone();
-                        reversed.reverse();
-                        Ok(Value::List(reversed))
-                    }
-                    _ => Err("rev requires a list".to_string()),
-                }
-            }
-            "enumerate" => {
-                let list = args.first().ok_or("enumerate requires 1 argument")?;
-                match list {
-                    Value::List(items) => {
-                        let result: Vec<Value> = items
-                            .iter()
-                            .enumerate()
-                            .map(|(i, v)| Value::Tuple(vec![Value::Int(i as i64), v.clone()]))
-                            .collect();
-                        Ok(Value::List(result))
-                    }
-                    _ => Err("enumerate requires a list".to_string()),
-                }
-            }
-            "zip" => {
-                let l1 = args.first().ok_or("zip requires 2 arguments")?;
-                let l2 = args.get(1).ok_or("zip requires 2 arguments")?;
-                match (l1, l2) {
-                    (Value::List(a), Value::List(b)) => {
-                        let result: Vec<Value> = a
-                            .iter()
-                            .zip(b.iter())
-                            .map(|(x, y)| Value::Tuple(vec![x.clone(), y.clone()]))
-                            .collect();
-                        Ok(Value::List(result))
-                    }
-                    _ => Err("zip requires two lists".to_string()),
-                }
-            }
-            "flat_map" => {
-                let list = args.first().ok_or("flat_map requires 2 arguments")?;
-                let func = args.get(1).ok_or("flat_map requires 2 arguments")?;
-                match list {
-                    Value::List(items) => {
-                        let mut result = Vec::new();
-                        for item in items {
-                            let mapped = self.call_function(func, &[item.clone()])?;
-                            match mapped {
-                                Value::List(inner) => result.extend(inner),
-                                other => result.push(other),
-                            }
-                        }
-                        Ok(Value::List(result))
-                    }
-                    _ => Err("flat_map requires a list".to_string()),
-                }
-            }
-            "any" => {
-                let list = args.first().ok_or("any requires 2 arguments")?;
-                let func = args.get(1).ok_or("any requires 2 arguments")?;
-                match list {
-                    Value::List(items) => {
-                        for item in items {
-                            let result = self.call_function(func, &[item.clone()])?;
-                            if result.is_truthy() {
-                                return Ok(Value::Bool(true));
-                            }
-                        }
-                        Ok(Value::Bool(false))
-                    }
-                    _ => Err("any requires a list".to_string()),
-                }
-            }
-            "all" => {
-                let list = args.first().ok_or("all requires 2 arguments")?;
-                let func = args.get(1).ok_or("all requires 2 arguments")?;
-                match list {
-                    Value::List(items) => {
-                        for item in items {
-                            let result = self.call_function(func, &[item.clone()])?;
-                            if !result.is_truthy() {
-                                return Ok(Value::Bool(false));
-                            }
-                        }
-                        Ok(Value::Bool(true))
-                    }
-                    _ => Err("all requires a list".to_string()),
-                }
-            }
-            "find" => {
-                let list = args.first().ok_or("find requires 2 arguments")?;
-                let func = args.get(1).ok_or("find requires 2 arguments")?;
-                match list {
-                    Value::List(items) => {
-                        for item in items {
-                            let result = self.call_function(func, &[item.clone()])?;
-                            if result.is_truthy() {
-                                return Ok(item.clone());
-                            }
-                        }
-                        Ok(Value::Unit)
-                    }
-                    _ => Err("find requires a list".to_string()),
-                }
-            }
-            "unique" => {
-                let list = args.first().ok_or("unique requires 1 argument")?;
-                match list {
-                    Value::List(items) => {
-                        let mut result = Vec::new();
-                        for item in items {
-                            if !result.iter().any(|v| self.values_equal(v, item)) {
-                                result.push(item.clone());
-                            }
-                        }
-                        Ok(Value::List(result))
-                    }
-                    _ => Err("unique requires a list".to_string()),
-                }
-            }
-            "chunk" => {
-                let list = args.first().ok_or("chunk requires 2 arguments")?;
-                let size = args.get(1).ok_or("chunk requires 2 arguments")?;
-                match (list, size) {
-                    (Value::List(items), Value::Int(n)) => {
-                        let n = *n as usize;
-                        let result: Vec<Value> = items
-                            .chunks(n)
-                            .map(|c| Value::List(c.to_vec()))
-                            .collect();
-                        Ok(Value::List(result))
-                    }
-                    _ => Err("chunk requires a list and integer".to_string()),
-                }
-            }
-            "take" => {
-                let list = args.first().ok_or("take requires 2 arguments")?;
-                let n = args.get(1).ok_or("take requires 2 arguments")?;
-                match (list, n) {
-                    (Value::List(items), Value::Int(n)) => {
-                        let n = *n as usize;
-                        Ok(Value::List(items[..n.min(items.len())].to_vec()))
-                    }
-                    _ => Err("take requires a list and integer".to_string()),
-                }
-            }
-            "skip" => {
-                let list = args.first().ok_or("skip requires 2 arguments")?;
-                let n = args.get(1).ok_or("skip requires 2 arguments")?;
-                match (list, n) {
-                    (Value::List(items), Value::Int(n)) => {
-                        let n = *n as usize;
-                        Ok(Value::List(items[n.min(items.len())..].to_vec()))
-                    }
-                    _ => Err("skip requires a list and integer".to_string()),
-                }
-            }
-            "min" => {
-                let a = args.first().ok_or("min requires 2 arguments")?;
-                let b = args.get(1).ok_or("min requires 2 arguments")?;
-                match (a, b) {
-                    (Value::Int(a), Value::Int(b)) => Ok(Value::Int(*a.min(b))),
-                    (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a.min(*b))),
-                    _ => Err("min requires comparable values".to_string()),
-                }
-            }
-            "max" => {
-                let a = args.first().ok_or("max requires 2 arguments")?;
-                let b = args.get(1).ok_or("max requires 2 arguments")?;
-                match (a, b) {
-                    (Value::Int(a), Value::Int(b)) => Ok(Value::Int(*a.max(b))),
-                    (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a.max(*b))),
-                    _ => Err("max requires comparable values".to_string()),
-                }
-            }
-            "abs" => {
-                let val = args.first().ok_or("abs requires 1 argument")?;
-                match val {
-                    Value::Int(n) => Ok(Value::Int(n.abs())),
-                    Value::Float(f) => Ok(Value::Float(f.abs())),
-                    _ => Err("abs requires a number".to_string()),
-                }
-            }
-            "dbg" => {
-                let val = args.first().ok_or("dbg requires 1 argument")?;
-                eprintln!("[dbg] {:?}", val);
-                Ok(val.clone())
-            }
-            "assert" => {
-                let val = args.first().ok_or("assert requires 1 argument")?;
-                if val.is_truthy() {
-                    Ok(Value::Unit)
-                } else {
-                    Err("Assertion failed".to_string())
-                }
-            }
-            "assert_eq" => {
-                if args.len() != 2 {
-                    return Err("assert_eq requires 2 arguments".to_string());
-                }
-                let actual = &args[0];
-                let expected = &args[1];
-                if self.values_equal(actual, expected) {
-                    Ok(Value::Unit)
-                } else {
-                    Err(format!(
-                        "[assert] expected: {}, got: {}",
-                        self.value_to_display(expected),
-                        self.value_to_display(actual)
-                    ))
-                }
-            }
-            "assert_ne" => {
-                if args.len() != 2 {
-                    return Err("assert_ne requires 2 arguments".to_string());
-                }
-                let actual = &args[0];
-                let expected = &args[1];
-                if !self.values_equal(actual, expected) {
-                    Ok(Value::Unit)
-                } else {
-                    Err(format!(
-                        "[assert] expected values to differ, both are: {}",
-                        self.value_to_display(actual)
-                    ))
-                }
-            }
-            "assert_true" => {
-                let val = args.first().ok_or("assert_true requires 1 argument")?;
-                if val.is_truthy() {
-                    Ok(Value::Unit)
-                } else {
-                    Err(format!(
-                        "[assert] expected truthy value, got: {}",
-                        self.value_to_display(val)
-                    ))
-                }
-            }
-            "assert_false" => {
-                let val = args.first().ok_or("assert_false requires 1 argument")?;
-                if !val.is_truthy() {
-                    Ok(Value::Unit)
-                } else {
-                    Err(format!(
-                        "[assert] expected falsy value, got: {}",
-                        self.value_to_display(val)
-                    ))
-                }
-            }
-            "type_of" => {
-                let val = args.first().ok_or("type_of requires 1 argument")?;
-                let type_name = match val {
-                    Value::Int(_) => "Int",
-                    Value::Float(_) => "Float",
-                    Value::Str(_) => "Str",
-                    Value::Bool(_) => "Bool",
-                    Value::Unit => "Unit",
-                    Value::Tuple(_) => "Tuple",
-                    Value::List(_) => "List",
-                    Value::Fn { .. } => "Fn",
-                    Value::Lambda { .. } => "Fn",
-                    Value::BuiltinFn(_) => "Fn",
-                };
-                Ok(Value::Str(type_name.to_string()))
-            }
-            "read_file" => {
-                let path = args.first().ok_or("read_file requires 1 argument")?;
-                match path {
-                    Value::Str(p) => match std::fs::read_to_string(p) {
-                        Ok(content) => Ok(Value::Str(content)),
-                        Err(e) => Err(format!("Cannot read file '{}': {}", p, e)),
-                    },
-                    _ => Err("read_file requires a string path".to_string()),
-                }
-            }
-            "write_file" => {
-                let path = args.first().ok_or("write_file requires 2 arguments")?;
-                let content = args.get(1).ok_or("write_file requires 2 arguments")?;
-                match (path, content) {
-                    (Value::Str(p), Value::Str(c)) => match std::fs::write(p, c) {
-                        Ok(_) => Ok(Value::Unit),
-                        Err(e) => Err(format!("Cannot write file '{}': {}", p, e)),
-                    },
-                    _ => Err("write_file requires string arguments".to_string()),
-                }
-            }
-            "read_line" => {
-                let mut input = String::new();
-                std::io::stdin()
-                    .read_line(&mut input)
-                    .map_err(|e| format!("Cannot read line: {}", e))?;
-                Ok(Value::Str(input.trim_end_matches('\n').to_string()))
-            }
-            "parse_json" => {
-                // Basic JSON parsing - just return the string for now
-                let val = args.first().ok_or("parse_json requires 1 argument")?;
-                match val {
-                    Value::Str(_) => Ok(val.clone()),
-                    _ => Err("parse_json requires a string".to_string()),
-                }
-            }
-            "group_by" => {
-                let list = args.first().ok_or("group_by requires 2 arguments")?;
-                let func = args.get(1).ok_or("group_by requires 2 arguments")?;
-                match list {
-                    Value::List(items) => {
-                        let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
-                        for item in items {
-                            let key = self.call_function(func, &[item.clone()])?;
-                            if let Some(group) = groups.iter_mut().find(|(k, _)| self.values_equal(k, &key)) {
-                                group.1.push(item.clone());
-                            } else {
-                                groups.push((key, vec![item.clone()]));
-                            }
-                        }
-                        let result: Vec<Value> = groups
-                            .into_iter()
-                            .map(|(k, v)| Value::Tuple(vec![k, Value::List(v)]))
-                            .collect();
-                        Ok(Value::List(result))
-                    }
-                    _ => Err("group_by requires a list".to_string()),
-                }
-            }
-            "flatten" => {
-                let list = args.first().ok_or("flatten requires 1 argument")?;
-                match list {
-                    Value::List(items) => {
-                        let mut result = Vec::new();
-                        for item in items {
-                            match item {
-                                Value::List(inner) => result.extend(inner.clone()),
-                                other => result.push(other.clone()),
-                            }
-                        }
-                        Ok(Value::List(result))
-                    }
-                    _ => Err("flatten requires a list".to_string()),
-                }
-            }
-            "reduce" => {
-                let list = args.first().ok_or("reduce requires 2 arguments")?;
-                let func = args.get(1).ok_or("reduce requires 2 arguments")?;
-                match list {
-                    Value::List(items) => {
-                        if items.is_empty() {
-                            return Err("reduce on empty list".to_string());
-                        }
-                        let mut acc = items[0].clone();
-                        for item in &items[1..] {
-                            acc = self.call_function(func, &[acc, item.clone()])?;
-                        }
-                        Ok(acc)
-                    }
-                    _ => Err("reduce requires a list".to_string()),
-                }
-            }
-            "replace" => {
-                let s = args.first().ok_or("replace requires 3 arguments")?;
-                let from = args.get(1).ok_or("replace requires 3 arguments")?;
-                let to = args.get(2).ok_or("replace requires 3 arguments")?;
-                match (s, from, to) {
-                    (Value::Str(s), Value::Str(f), Value::Str(t)) => {
-                        Ok(Value::Str(s.replace(f.as_str(), t)))
-                    }
-                    _ => Err("replace requires string arguments".to_string()),
-                }
-            }
-            "starts_with" => {
-                let s = args.first().ok_or("starts_with requires 2 arguments")?;
-                let prefix = args.get(1).ok_or("starts_with requires 2 arguments")?;
-                match (s, prefix) {
-                    (Value::Str(s), Value::Str(p)) => Ok(Value::Bool(s.starts_with(p.as_str()))),
-                    _ => Err("starts_with requires string arguments".to_string()),
-                }
-            }
-            "ends_with" => {
-                let s = args.first().ok_or("ends_with requires 2 arguments")?;
-                let suffix = args.get(1).ok_or("ends_with requires 2 arguments")?;
-                match (s, suffix) {
-                    (Value::Str(s), Value::Str(p)) => Ok(Value::Bool(s.ends_with(p.as_str()))),
-                    _ => Err("ends_with requires string arguments".to_string()),
-                }
-            }
-            "to_upper" => {
-                let s = args.first().ok_or("to_upper requires 1 argument")?;
-                match s {
-                    Value::Str(s) => Ok(Value::Str(s.to_uppercase())),
-                    _ => Err("to_upper requires a string".to_string()),
-                }
-            }
-            "to_lower" => {
-                let s = args.first().ok_or("to_lower requires 1 argument")?;
-                match s {
-                    Value::Str(s) => Ok(Value::Str(s.to_lowercase())),
-                    _ => Err("to_lower requires a string".to_string()),
-                }
-            }
-            _ => Err(format!("Unknown builtin function: {}", name)),
-        }
-    }
-
-    fn bind_pattern(&mut self, pattern: &Pattern, value: &Value) -> Result<(), String> {
-        match pattern {
-            Pattern::Ident(name) => {
-                self.env.set(name.clone(), value.clone());
-                Ok(())
-            }
-            Pattern::Wildcard => Ok(()),
-            Pattern::Tuple(pats) => match value {
-                Value::Tuple(vals) => {
-                    if pats.len() != vals.len() {
-                        return Err(format!(
-                            "Tuple pattern has {} elements but value has {}",
-                            pats.len(),
-                            vals.len()
-                        ));
-                    }
-                    for (p, v) in pats.iter().zip(vals.iter()) {
-                        self.bind_pattern(p, v)?;
-                    }
-                    Ok(())
-                }
-                _ => Err(format!("Cannot destructure {} as tuple", value)),
-            },
-            Pattern::List(pats) => match value {
-                Value::List(vals) => {
-                    if pats.len() != vals.len() {
-                        return Err(format!(
-                            "List pattern has {} elements but value has {}",
-                            pats.len(),
-                            vals.len()
-                        ));
-                    }
-                    for (p, v) in pats.iter().zip(vals.iter()) {
-                        self.bind_pattern(p, v)?;
-                    }
-                    Ok(())
-                }
-                _ => Err(format!("Cannot destructure {} as list", value)),
-            },
-            Pattern::Literal(_) => {
-                // Literal patterns in let bindings just check equality
-                Ok(())
-            }
-            _ => Err(format!("Unsupported pattern in let binding: {:?}", pattern)),
-        }
-    }
-
-    fn match_pattern(&mut self, pattern: &Pattern, value: &Value) -> Result<bool, String> {
-        match pattern {
-            Pattern::Wildcard => Ok(true),
-            Pattern::Ident(name) => {
-                self.env.set(name.clone(), value.clone());
-                Ok(true)
-            }
-            Pattern::Literal(lit) => {
-                let pat_val = self.literal_to_value(lit);
-                Ok(self.values_equal(&pat_val, value))
-            }
-            Pattern::Tuple(pats) => match value {
-                Value::Tuple(vals) => {
-                    if pats.len() != vals.len() {
-                        return Ok(false);
-                    }
-                    for (p, v) in pats.iter().zip(vals.iter()) {
-                        if !self.match_pattern(p, v)? {
-                            return Ok(false);
-                        }
-                    }
-                    Ok(true)
-                }
-                _ => Ok(false),
-            },
-            Pattern::List(pats) => match value {
-                Value::List(vals) => {
-                    if pats.len() != vals.len() {
-                        return Ok(false);
-                    }
-                    for (p, v) in pats.iter().zip(vals.iter()) {
-                        if !self.match_pattern(p, v)? {
-                            return Ok(false);
-                        }
-                    }
-                    Ok(true)
-                }
-                _ => Ok(false),
-            },
-            Pattern::Or(pats) => {
-                for p in pats {
-                    if self.match_pattern(p, value)? {
-                        return Ok(true);
-                    }
-                }
-                Ok(false)
-            }
-            Pattern::Constructor(name, _pats) => {
-                // For now, just match enum variants
-                Err(format!("Constructor pattern matching not yet implemented for {}", name))
-            }
-        }
-    }
-
-    fn values_equal(&self, a: &Value, b: &Value) -> bool {
-        match (a, b) {
-            (Value::Int(a), Value::Int(b)) => a == b,
-            (Value::Float(a), Value::Float(b)) => a == b,
-            (Value::Str(a), Value::Str(b)) => a == b,
-            (Value::Bool(a), Value::Bool(b)) => a == b,
-            (Value::Unit, Value::Unit) => true,
-            (Value::Tuple(a), Value::Tuple(b)) => {
-                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| self.values_equal(x, y))
-            }
-            (Value::List(a), Value::List(b)) => {
-                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| self.values_equal(x, y))
-            }
-            _ => false,
-        }
-    }
-
-    fn compare_values(&self, a: &Value, b: &Value) -> std::cmp::Ordering {
-        match (a, b) {
-            (Value::Int(a), Value::Int(b)) => a.cmp(b),
-            (Value::Float(a), Value::Float(b)) => a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
-            (Value::Str(a), Value::Str(b)) => a.cmp(b),
-            _ => std::cmp::Ordering::Equal,
-        }
-    }
-
-    fn value_to_iterable(&self, value: &Value) -> Result<Vec<Value>, String> {
-        match value {
-            Value::List(items) => Ok(items.clone()),
-            Value::Str(s) => Ok(s.chars().map(|c| Value::Str(c.to_string())).collect()),
-            _ => Err(format!("Cannot iterate over {}", value)),
-        }
-    }
-
-    fn value_to_debug(&self, value: &Value) -> String {
-        format!("{:?}", value)
-    }
-
-    /// Format a value for user-facing display in assertion messages.
-    /// Uses the Display impl (e.g., `1`, `"hello"`, `[1, 2]`) with
-    /// strings wrapped in quotes to distinguish them from other types.
-    fn value_to_display(&self, value: &Value) -> String {
-        match value {
-            Value::Str(s) => format!("\"{}\"", s),
-            other => format!("{}", other),
-        }
+    /// Call a function value with arguments (used by test runner).
+    pub fn call_function(&mut self, func: &Value, args: &[Value]) -> Result<Value, String> {
+        call_value(func, args)
     }
 }

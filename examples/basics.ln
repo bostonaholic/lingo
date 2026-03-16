@@ -1,43 +1,39 @@
-fn double(x: Int) -> Int {
-  x * 2
-}
+(defn double (x) (* x 2))
 
-fn main() {
-  # Arithmetic
-  let x = 10
-  let y = 3
-  println("x + y = {x + y}")
-  println("x % y = {x % y}")
+(defn main ()
+  ; Arithmetic
+  (def x 10)
+  (def y 3)
+  (println (str "x + y = " (->str (+ x y))))
+  (println (str "x % y = " (->str (mod x y))))
 
-  # If/else as expression
-  let status = if x > 5 { "big" } else { "small" }
-  println("x is {status}")
+  ; If/else as expression
+  (def status (if (> x 5) "big" "small"))
+  (println (str "x is " status))
 
-  # Lists and pipeline
-  let nums = [1, 2, 3, 4, 5]
-  let doubled = nums |> map(n => n * 2)
-  println("doubled: {doubled}")
+  ; Lists and threading
+  (def nums (list 1 2 3 4 5))
+  (def doubled (-> nums (map (fn (n) (* n 2)))))
+  (println (str "doubled: " (->str doubled)))
 
-  let evens = nums |> filter(n => n % 2 == 0)
-  println("evens: {evens}")
+  (def evens (-> nums (filter (fn (n) (= (mod n 2) 0)))))
+  (println (str "evens: " (->str evens)))
 
-  let total = nums |> fold(0, (acc, n) => acc + n)
-  println("total: {total}")
+  (def total (-> nums (fold 0 (fn (acc n) (+ acc n)))))
+  (println (str "total: " (->str total)))
 
-  # Function calls
-  println("double(21) = {double(21)}")
+  ; Function calls
+  (println (str "(double 21) = " (->str (double 21))))
 
-  # String operations
-  let greeting = "Hello, World!"
-  println("length: {len(greeting)}")
-  println("upper: {to_upper(greeting)}")
+  ; String operations
+  (def greeting "Hello, World!")
+  (println (str "length: " (->str (strlen greeting))))
+  (println (str "upper: " (upcase greeting)))
 
-  # Pattern matching
-  let items = [1, 2, 3]
-  let desc = match len(items) {
-    0 => "empty"
-    1 => "singleton"
-    _ => "multiple"
-  }
-  println("items: {desc}")
-}
+  ; Pattern matching
+  (def items (list 1 2 3))
+  (def desc (match (len items)
+    (0 "empty")
+    (1 "singleton")
+    (_ "multiple")))
+  (println (str "items: " desc)))

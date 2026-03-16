@@ -1,35 +1,28 @@
-fn test_assert_eq_integers() {
-  assert_eq(1, 1)
-}
+(defn test-assert-eq-integers ()
+  (assert-eq 1 1))
 
-fn test_assert_eq_strings() {
-  assert_eq("hello", "hello")
-}
+(defn test-assert-eq-strings ()
+  (assert-eq "hello" "hello"))
 
-fn test_assert_eq_lists() {
-  assert_eq([1, 2, 3], [1, 2, 3])
-}
+(defn test-assert-eq-lists ()
+  (assert-eq (list 1 2 3) (list 1 2 3)))
 
-fn test_assert_eq_tuples() {
-  assert_eq((1, "a"), (1, "a"))
-}
+(defn test-assert-ne-different-values ()
+  (assert-ne 1 2))
 
-fn test_assert_ne_different_values() {
-  assert_ne(1, 2)
-}
+(defn test-assert-true-truthy ()
+  (do
+    (assert-true true)
+    (assert-true 1)
+    (assert-true "nonempty")))
 
-fn test_assert_true_truthy() {
-  assert_true(true)
-  assert_true(1)
-  assert_true("nonempty")
-}
+(defn test-assert-false-falsy ()
+  (do
+    (assert-false false)
+    (assert-false 0)))
 
-fn test_assert_false_falsy() {
-  assert_false(false)
-  assert_false(0)
-}
-
-fn test_pipeline_with_assertions() {
-  let result = [1, 2, 3] |> map(n => n * 2) |> filter(n => n > 2)
-  assert_eq(result, [4, 6])
-}
+(defn test-pipeline-with-assertions ()
+  (def result (-> (list 1 2 3)
+                     (map (fn (n) (* n 2)))
+                     (filter (fn (n) (> n 2)))))
+  (assert-eq result (list 4 6)))

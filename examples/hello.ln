@@ -1,4 +1,3 @@
-fn main() {
-  let name = "World"
-  println("Hello, {name}!")
-}
+(defn main ()
+  (def name "World")
+  (println (str "Hello, " name "!")))
